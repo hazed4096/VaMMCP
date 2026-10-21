@@ -110,12 +110,14 @@ namespace VaMMCP.Mcp {
 				.P("path", "string", "Preset path from list_clothing_presets", true)
 				.P("person", "string", "Person uid (default: first Person)", false)
 				.Fn(api.LoadClothingPreset));
-			tools.Add(new Tool("list_clothing_items", "List clothing items currently on a person.")
+			tools.Add(new Tool("list_clothing_items", "List the clothing a person is actually wearing (uid/name/active), plus a 'worn' summary and libraryCount. Pass all=true to dump the whole clothing library, including items that are not worn.")
 				.P("person", "string", "Person uid (default: first Person)", false)
+				.P("all", "boolean", "true = include unworn library items (default false: worn only)", false)
 				.Fn(api.ListClothingItems));
-			tools.Add(new Tool("add_clothing_item", "Add a clothing item to a person from its .vam/.json path (package paths work, e.g. from list_clothing_presets). Waits for the character to be ready; loads asynchronously. Use set_clothing_item_on to activate it.")
+			tools.Add(new Tool("add_clothing_item", "Add a clothing item to a person from its .vam/.json path (package paths work, e.g. from list_clothing_presets). Blocks until VaM confirms the item exists and is worn, and returns ok=false with a hint when the runtime clothing creator is not initialised (open Person > Clothing once in VaM).")
 				.P("path", "string", "Clothing item .vam/.json path", true)
 				.P("person", "string", "Person uid (default: first Person)", false)
+				.P("wait_seconds", "number", "How long to wait for the async load (default 20)", false)
 				.Timeout(60000).Poller()
 				.Fn(api.AddClothingItem));
 			tools.Add(new Tool("remove_clothing_item", "Remove a clothing item from a person.")

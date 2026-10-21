@@ -68,9 +68,9 @@ VaM 运行时状态：插件版本、VaM 版本、原子/人物数量、端点�
 | `list_packages` | — | 已安装的 .var 包 |
 | `list_clothing_presets` | `search?` | 服装预设/物品：磁盘 + **递归扫描所有包**的 `Custom/Clothing`（.vam/.json） |
 | `load_clothing_preset` | `path`*, `person?` | 应用服装预设 |
-| `list_clothing_items` | `person?` | 人物当前服装物品（uid/名称/active） |
-| `add_clothing_item` | `path`*, `person?` | 添加服装物品（包路径 `.vam`；等待角色就绪后加载） |
-| `remove_clothing_item` | `id`*, `person?` | 移除 |
+| `list_clothing_items` | `person?`、`all?` | 实际穿着的服装（uid/名称/active）及 `worn` 摘要；`all=true` 同时返回未穿着的库项目 |
+| `add_clothing_item` | `path`*、`person?`、`wait_seconds?` | 添加服装（`.vam` 包路径）；优先激活库中已有项目，否则等待 VaM 确认已穿上，无法添加时返回 `ok:false` 与提示 |
+| `remove_clothing_item` | `id`*, `person?` | 移除服装（删除延迟到帧末，可用 list_clothing_items 确认） |
 | `set_clothing_item_on` | `id`*, `on`*, `person?` | 穿/脱 |
 | `list_hair_presets` / `load_hair_preset` / `list_hair_items` / `add_hair_item` / `remove_hair_item` / `set_hair_item_on` | 同服装 | 发型（`Custom/Hair`） |
 

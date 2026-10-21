@@ -6,6 +6,29 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- **`add_clothing_item` now works even when VaM's runtime clothing creator is
+  not initialised.** Clothing paths VaM already has in the person's library are activated
+  directly (`"activated":true`) instead of being silently dropped, which is why adds used to
+  "succeed" without any garment appearing.
+- **`add_clothing_item` no longer lies about success.** It used to return
+  `{"loading":true}` right after calling `LoadFromPath`, so an add that VaM silently dropped
+  (its runtime clothing creator was never initialised because the person's Clothing tab had
+  never been opened in that scene) looked identical to a working add. The tool now waits for a
+  new worn item to appear and returns `ok:true` with its uid, or `ok:false` plus a
+  `hint`/`libraryBefore`/`libraryAfter` explaining what to do.
+- `list_clothing_items` only returned the person's whole clothing *library* (hundreds of
+  unworn entries with an `active` flag). It now returns the worn items, a `worn` uid list and
+  `activeCount`/`libraryCount`; `all=true` restores the full dump.
+- `set_clothing_item_on` and `remove_clothing_item` accept a uid, a display name or the tail of
+  a package path, and report the resulting state (`on`/`changed`, `removed` + `on` + `libraryCount`) instead of
+  echoing the request. `remove_clothing_item` refuses to delete the clothing creator item.
+- The clothing "creator" helper item is no longer listed, counted or treated as a garment by
+  `list_clothing_items` / `add_clothing_item` (it was reported as "worn" and even as a
+  successfully added item).
+- `Invoke` now tolerates overloaded VaM methods instead of throwing
+  `AmbiguousMatchException`, which fixes `set_hair_item_on`.
+
 ## [1.0.1] - 2026-08-21
 
 ### Changed

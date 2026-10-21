@@ -192,10 +192,31 @@ namespace VaMMCP.Api {
 			}
 		}
 
+		/// <summary>Invoke a method by name, tolerating overloads (GetMethod(name) throws
+		/// AmbiguousMatchException when VaM exposes several overloads, e.g. SetActiveHairItem).</summary>
 		public static object Invoke(object target, string method, params object[] args) {
-			MethodInfo m = target.GetType().GetMethod(method, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-			if (m == null) throw new ApiError("method not found: " + method + " on " + target.GetType().Name);
-			return m.Invoke(target, args);
+			int argc = args == null ? 0 : args.Length;
+			MethodInfo best = null;
+			foreach (MethodInfo m in target.GetType().GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)) {
+				if (m.Name != method) continue;
+				ParameterInfo[] ps = m.GetParameters();
+				if (ps.Length != argc) continue;
+				bool fits = true;
+				for (int i = 0; i < ps.Length; i++) {
+					object a = args[i];
+					if (a == null) continue;
+					Type at = a.GetType();
+					if (ps[i].ParameterType.IsAssignableFrom(at)) continue;
+					// numeric literals may be int where the method wants float
+					if (ps[i].ParameterType.IsPrimitive && at.IsPrimitive) continue;
+					fits = false;
+					break;
+				}
+				if (fits) { best = m; break; }
+				if (best == null) best = m;
+			}
+			if (best == null) throw new ApiError("method not found: " + method + " on " + target.GetType().Name);
+			return best.Invoke(target, args);
 		}
 
 		/// <summary>Find a component by type name without a compile-time reference (tries plain name, MeshVR.* and full scan fallback).</summary>
@@ -819,24 +840,45 @@ namespace VaMMCP.Api {
 
 		// ===================== clothing / hair =====================
 
+		/// <summary>Clothing items on a person. <c>sel.clothingItems</c> is the person's whole
+		/// clothing *library* (every item VaM has instantiated, worn or not), so by default we
+		/// return only what is actually worn and summarise the rest. Pass <c>all=true</c> for the
+		/// full library.</summary>
 		public JSONNode ListClothingItems(JSONNode args) {
 			Atom p = RequirePerson(S(args, "person"));
 			DAZCharacterSelector sel = Selector(p);
+			bool all = Bool(args, "all", false);
+			DAZClothingItem creator = CreatorFor(sel);
 			JSONArray arr = new JSONArray();
+			JSONArray worn = new JSONArray();
 			DAZClothingItem[] items = sel.clothingItems;
+			int total = 0;
+			int active = 0;
 			if (items != null) {
 				foreach (DAZClothingItem it in items) {
 					if (it == null) continue;
+					bool isCreator = creator != null && it == creator;
+					if (!isCreator) total++;
+					bool on = it.active;
+					if (on && !isCreator) {
+						active++;
+						worn.Add(it.uid);
+					}
+					if (!all && (!on || isCreator)) continue;
 					JSONClass row = new JSONClass();
 					row["uid"] = it.uid;
 					row["name"] = it.displayName != null ? it.displayName : "";
-					row["active"] = JSONRaw.Bool(it.active);
+					row["active"] = JSONRaw.Bool(on);
+					if (isCreator) row["creator"] = JSONRaw.Bool(true);
 					arr.Add(row);
 				}
 			}
 			JSONClass r = new JSONClass();
 			r["person"] = p.uid;
 			r["count"] = JSONRaw.Num(arr.Count);
+			r["activeCount"] = JSONRaw.Num(active);
+			r["libraryCount"] = JSONRaw.Num(total);
+			r["worn"] = worn;
 			r["items"] = arr;
 			return r;
 		}
@@ -863,25 +905,171 @@ namespace VaMMCP.Api {
 			return r;
 		}
 
-		/// <summary>Poller tool. Adds a clothing item to a person from its .vam/.json path.
-		/// Waits for the character to finish loading so the creator item has its DAZRuntimeCreator component.</summary>
+		private static DAZClothingItem CreatorFor(DAZCharacterSelector sel) {
+			if (sel == null) return null;
+			return sel.gender == DAZCharacterSelector.Gender.Male ? sel.maleClothingCreatorItem : sel.femaleClothingCreatorItem;
+		}
+
+		/// <summary>Resolve a clothing item by uid, display name or the tail of its path.
+		/// <c>GetClothingItem</c> only matches uids, which are package paths in practice.</summary>
+		private static DAZClothingItem FindClothingItem(DAZCharacterSelector sel, string id) {
+			DAZClothingItem[] items = sel.clothingItems;
+			if (items == null || id == null) return null;
+			string needle = id.Trim();
+			if (needle == "") return null;
+			string low = needle.ToLowerInvariant();
+			DAZClothingItem nameHit = null;
+			DAZClothingItem tailHit = null;
+			foreach (DAZClothingItem it in items) {
+				if (it == null) continue;
+				if (it.uid == needle) return it;
+				string name = it.displayName != null ? it.displayName : "";
+				if (name == needle) return it;
+				string uidLow = it.uid != null ? it.uid.ToLowerInvariant() : "";
+				if (nameHit == null && name.ToLowerInvariant() == low) nameHit = it;
+				if (tailHit == null && uidLow.Length > 0) {
+					string tail = uidLow.Substring(uidLow.LastIndexOf('/') + 1);
+					if (tail == low) tailHit = it;
+				}
+			}
+			return nameHit != null ? nameHit : tailHit;
+		}
+
+		/// <summary>uids of worn garments, excluding the clothing *creator* helper item
+		/// (activating the creator is an implementation detail, not a garment).</summary>
+		private static HashSet<string> ActiveClothingUids(DAZCharacterSelector sel) {
+			HashSet<string> set = new HashSet<string>();
+			DAZClothingItem[] items = sel.clothingItems;
+			if (items == null) return set;
+			DAZClothingItem creator = CreatorFor(sel);
+			foreach (DAZClothingItem it in items) {
+				if (it == null || it == creator) continue;
+				if (it.active && it.uid != null) set.Add(it.uid);
+			}
+			return set;
+		}
+
+		/// <summary>Poller tool. Adds a clothing item and *waits until VaM confirms it exists*.
+		/// A previous version returned <c>loading:true</c> unconditionally: VaM silently no-ops
+		/// LoadFromPath when the person's runtime clothing creator was never initialised (its
+		/// Person > Clothing tab has not been opened in this scene), so callers were told an add
+		/// succeeded while the scene stayed unchanged.</summary>
 		public JSONNode AddClothingItem(JSONNode args) {
 			Atom p = Mt.Run(() => RequirePerson(S(args, "person")), 15000);
 			string path = S(args, "path");
 			if (path == "") throw new ApiError("path required (clothing item .vam/.json file, e.g. from list_clothing_presets)");
-			DAZClothingItem creator = Mt.Run(delegate {
-				DAZCharacterSelector sel = Selector(p);
-				return sel.gender == DAZCharacterSelector.Gender.Male ? sel.maleClothingCreatorItem : sel.femaleClothingCreatorItem;
+			int waitSeconds = Has(args, "wait_seconds") ? args["wait_seconds"].AsInt : 20;
+			if (waitSeconds < 1) waitSeconds = 1;
+			string wanted = path.Substring(path.LastIndexOf('/') + 1);
+			if (wanted.EndsWith(".vam", StringComparison.OrdinalIgnoreCase)) wanted = wanted.Substring(0, wanted.Length - 4);
+			else if (wanted.EndsWith(".json", StringComparison.OrdinalIgnoreCase)) wanted = wanted.Substring(0, wanted.Length - 5);
+
+			DAZClothingItem creator = Mt.Run(() => CreatorFor(Selector(p)), 15000);
+			if (creator == null) throw new ApiError("no clothing creator item available on " + p.uid);
+
+			// Already worn? Then this is a no-op and should say so instead of "loading".
+			DAZClothingItem existing = Mt.Run(() => FindClothingItem(Selector(p), wanted), 15000);
+			if (existing != null && existing.active) {
+				JSONClass done = new JSONClass();
+				done["person"] = p.uid;
+				done["path"] = path;
+				done["ok"] = JSONRaw.Bool(true);
+				done["added"] = existing.uid;
+				done["alreadyActive"] = JSONRaw.Bool(true);
+				return done;
+			}
+
+			HashSet<string> before = Mt.Run(() => ActiveClothingUids(Selector(p)), 15000);
+			int libraryBefore = Mt.Run(() => {
+				DAZClothingItem[] its = Selector(p).clothingItems;
+				return its == null ? 0 : its.Length;
 			}, 15000);
-			if (creator == null) throw new ApiError("no clothing creator item available");
+
 			Mt.Run(() => { try { Selector(p).SetActiveClothingItem(creator, true); } catch { } }, 15000);
 			Component drc = PollComponent(creator, 40);
-			if (drc == null) throw new ApiError("no DAZRuntimeCreator component on the creator item (character may still be loading; retry in a few seconds)");
+			if (drc == null) {
+				JSONClass fail = new JSONClass();
+				fail["person"] = p.uid;
+				fail["path"] = path;
+				fail["ok"] = JSONRaw.Bool(false);
+				fail["reason"] = "no DAZRuntimeCreator component on the clothing creator item";
+				fail["hint"] = "Open " + p.uid + " > Clothing in VaM once (this initialises the runtime creator), then retry.";
+				return fail;
+			}
+
 			Mt.Run(() => Invoke(drc, "LoadFromPath", path), 15000);
+
+			// LoadFromPath starts an async asset load; poll until a new item appears, becomes
+			// active, or the deadline passes.
+			DateTime deadline = DateTime.UtcNow.AddSeconds(waitSeconds);
+			string addedUid = null;
+			string createdUid = null;
+			while (DateTime.UtcNow < deadline) {
+				JSONClass snap = Mt.Run(() => {
+					DAZCharacterSelector sel = Selector(p);
+					DAZClothingItem[] its = sel.clothingItems;
+					JSONClass o = new JSONClass();
+					int n = its == null ? 0 : its.Length;
+					o["library"] = JSONRaw.Num(n);
+					DAZClothingItem found = FindClothingItem(sel, wanted);
+					if (found == creator) found = null;
+					if (found != null && found.active) o["active"] = found.uid;
+					else if (found != null) o["present"] = found.uid;
+					return o;
+				}, 15000);
+				if (snap["active"] != null) { addedUid = snap["active"].Value; break; }
+				if (snap["present"] != null) createdUid = snap["present"].Value;
+				Thread.Sleep(500);
+			}
+
+			// Fallback: any newly worn item we did not have before (covers renamed uids).
+			if (addedUid == null) {
+				HashSet<string> after = Mt.Run(() => ActiveClothingUids(Selector(p)), 15000);
+				foreach (string uid in after) {
+					if (!before.Contains(uid)) { addedUid = uid; break; }
+				}
+			}
+
+			// The item may already sit in the person's library (inactive): LoadFromPath then
+			// does nothing useful, but activating it is exactly what the Clothing tab's
+			// toggle does, and it works without the runtime creator.
+			bool activated = false;
+			if (addedUid == null && createdUid != null) {
+				string target = createdUid;
+				addedUid = Mt.Run(() => {
+					DAZCharacterSelector sel = Selector(p);
+					DAZClothingItem it = FindClothingItem(sel, target);
+					if (it == null || it == CreatorFor(sel)) return null;
+					sel.SetActiveClothingItem(it, true);
+					return it.active ? it.uid : null;
+				}, 15000);
+				activated = addedUid != null;
+			}
+
 			JSONClass r = new JSONClass();
 			r["person"] = p.uid;
 			r["path"] = path;
-			r["loading"] = JSONRaw.Bool(true);
+			if (addedUid != null) {
+				r["ok"] = JSONRaw.Bool(true);
+				r["added"] = addedUid;
+				if (activated) r["activated"] = JSONRaw.Bool(true);
+				r["worn"] = JSONRaw.Num(Mt.Run(() => ActiveClothingUids(Selector(p)).Count, 15000));
+				return r;
+			}
+
+			int libraryAfter = Mt.Run(() => {
+				DAZClothingItem[] its = Selector(p).clothingItems;
+				return its == null ? 0 : its.Length;
+			}, 15000);
+			r["ok"] = JSONRaw.Bool(false);
+			r["reason"] = createdUid != null
+				? "item was created but never became active"
+				: "VaM created no clothing item for this path";
+			r["libraryBefore"] = JSONRaw.Num(libraryBefore);
+			r["libraryAfter"] = JSONRaw.Num(libraryAfter);
+			r["hint"] = "If nothing changed, VaM's runtime clothing creator is not initialised: "
+				+ "open " + p.uid + " > Clothing in VaM once, then retry. Paths must point at a .vam "
+				+ "clothing item (see list_clothing_presets), not at a folder.";
 			return r;
 		}
 
@@ -922,16 +1110,24 @@ namespace VaMMCP.Api {
 			DAZCharacterSelector sel = Selector(p);
 			string id = S(args, "id");
 			if (id == "") throw new ApiError("id required (see list_clothing_items)");
-			DAZClothingItem item = sel.GetClothingItem(id);
-			if (item == null) throw new ApiError("clothing item not found: " + id);
+			DAZClothingItem item = FindClothingItem(sel, id);
+			if (item == null) throw new ApiError("clothing item not found: " + id + " (see list_clothing_items all=true)");
+			if (item == CreatorFor(sel)) throw new ApiError("refusing to remove the clothing creator item; remove the garments instead");
+			string removedUid = item.uid;
 			sel.SetActiveClothingItem(item, false);
 			DAZClothingItemControl ctrl = item.GetComponentInChildren<DAZClothingItemControl>();
 			if (ctrl != null) {
 				try { ctrl.Delete(); } catch (Exception e) { Log.Debug("clothing delete: " + e.Message); }
 			}
+			// Delete() is deferred to the end of the frame and this tool runs on the main
+			// thread, so we can only report the immediate, verifiable effects here.
+			DAZClothingItem[] left = Selector(p).clothingItems;
 			JSONClass r = new JSONClass();
 			r["person"] = p.uid;
-			r["removed"] = id;
+			r["removed"] = removedUid;
+			r["on"] = JSONRaw.Bool(item.active);
+			r["libraryCount"] = JSONRaw.Num(left == null ? 0 : left.Length);
+			r["note"] = "VaM destroys the item at the end of the frame; call list_clothing_items to confirm it is gone.";
 			return r;
 		}
 
@@ -963,14 +1159,16 @@ namespace VaMMCP.Api {
 			Atom p = RequirePerson(S(args, "person"));
 			DAZCharacterSelector sel = Selector(p);
 			string id = S(args, "id");
+			if (id == "") throw new ApiError("id required (see list_clothing_items)");
 			bool on = Bool(args, "on", true);
-			DAZClothingItem item = sel.GetClothingItem(id);
-			if (item == null) throw new ApiError("clothing item not found: " + id);
+			DAZClothingItem item = FindClothingItem(sel, id);
+			if (item == null) throw new ApiError("clothing item not found: " + id + " (see list_clothing_items all=true)");
 			sel.SetActiveClothingItem(item, on);
 			JSONClass r = new JSONClass();
 			r["person"] = p.uid;
-			r["id"] = id;
-			r["on"] = JSONRaw.Bool(on);
+			r["id"] = item.uid;
+			r["on"] = JSONRaw.Bool(item.active);
+			r["changed"] = JSONRaw.Bool(item.active == on);
 			return r;
 		}
 
