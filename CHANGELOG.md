@@ -6,7 +6,17 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- `press_key` tool: sends a real key press to VaM (Escape dismisses modal prompts such as the
+  save-screenshot dialog). It brings the VaM window to the foreground first and refuses to send
+  if it could not confirm VaM holds focus, so a stray key cannot land in another application.
+
 ### Fixed
+- **`press_key` now restores a minimised VaM window and waits for the player loop to
+  resume before sending the key.** A minimised VaM does not run `Update()`, so the key
+  was delivered but never read and the save-screenshot prompt stayed up. It also fixes
+  the `GetCurrentThreadId` entry-point lookup (the function lives in kernel32, not user32)
+  that could fail while taking focus.
 - **`add_clothing_item` now works even when VaM's runtime clothing creator is
   not initialised.** Clothing paths VaM already has in the person's library are activated
   directly (`"activated":true`) instead of being silently dropped, which is why adds used to

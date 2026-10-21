@@ -1,4 +1,4 @@
-# Tool reference (63 tools)
+# Tool reference (64 tools)
 
 *[中文版](TOOLS.zh-CN.md)*
 
@@ -21,6 +21,7 @@ VaM runtime status: plugin version, VaM version, atom/person counts, endpoint, e
 | `load_scene` | `path`*, `merge?` | Load a scene (`merge=true` merges into the current one); .var paths work (`Package.1:/Saves/scene/x.json`) |
 | `new_scene` | — | New empty scene (**discards the current one**; an empty scene has no lights — add one or raise ambient light) |
 | `save_scene` | `path?` | Save the scene (default `Saves/scene/VaMMCP_<timestamp>.json`; an existing file is removed first so the save is not swallowed by VaM's confirm dialog) |
+| `press_key` | `key`*, `times?`, `focus?` | Send a real key press to VaM (Escape dismisses modal prompts such as the save-screenshot dialog); refuses to send if VaM cannot be focused |
 
 ## Atom
 

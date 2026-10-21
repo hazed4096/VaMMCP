@@ -1,8 +1,10 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using UnityEngine;
@@ -339,6 +341,148 @@ namespace VaMMCP.Api {
 			JSONClass r = new JSONClass();
 			r["saved"] = path;
 			return r;
+		}
+
+		// ===================== input =====================
+
+		[DllImport("user32.dll")]
+		private static extern IntPtr GetForegroundWindow();
+		[DllImport("user32.dll")]
+		private static extern bool SetForegroundWindow(IntPtr hWnd);
+		[DllImport("user32.dll")]
+		private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+
+		private const uint KeyUp = 0x0002;
+
+		private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+		[DllImport("user32.dll")]
+		private static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
+		[DllImport("user32.dll")]
+		private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+		[DllImport("user32.dll")]
+		private static extern bool IsWindowVisible(IntPtr hWnd);
+		[DllImport("user32.dll")]
+		private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
+		[DllImport("kernel32.dll")]
+		private static extern uint GetCurrentThreadId();
+		[DllImport("user32.dll")]
+		private static extern bool IsIconic(IntPtr hWnd);
+		[DllImport("user32.dll")]
+		private static extern bool ShowWindow(IntPtr hWnd, int cmd);
+
+		/// <summary>Raise our own window. SetForegroundWindow is refused while another
+		/// process owns the foreground, so attach to that thread first and retry.</summary>
+		private static bool FocusOwnWindow(IntPtr hwnd) {
+			if (hwnd == IntPtr.Zero) return false;
+			// A minimised player keeps Update() frozen, so keys are never consumed.
+			if (IsIconic(hwnd)) ShowWindow(hwnd, 9 /* SW_RESTORE */);
+			SetForegroundWindow(hwnd);
+			Thread.Sleep(120);
+			if (GetForegroundWindow() == hwnd) return true;
+			IntPtr fg = GetForegroundWindow();
+			uint fgPid;
+			uint fgThread = fg != IntPtr.Zero ? GetWindowThreadProcessId(fg, out fgPid) : 0;
+			uint self = GetCurrentThreadId();
+			bool attached = fgThread != 0 && fgThread != self && AttachThreadInput(fgThread, self, true);
+			try {
+				SetForegroundWindow(hwnd);
+				Thread.Sleep(150);
+			} finally {
+				if (attached) AttachThreadInput(fgThread, self, false);
+			}
+			return GetForegroundWindow() == hwnd;
+		}
+
+		/// <summary>Unity does not always expose a Process.MainWindowHandle, so find the
+		/// biggest visible top-level window that belongs to this process instead.</summary>
+		private static IntPtr OwnWindow() {
+			IntPtr found = IntPtr.Zero;
+			uint self = (uint)Process.GetCurrentProcess().Id;
+			EnumWindows(delegate(IntPtr h, IntPtr l) {
+				uint pid;
+				GetWindowThreadProcessId(h, out pid);
+				if (pid == self && IsWindowVisible(h)) { found = h; return false; }
+				return true;
+			}, IntPtr.Zero);
+			if (found == IntPtr.Zero) found = Process.GetCurrentProcess().MainWindowHandle;
+			return found;
+		}
+
+		/// <summary>Synthesise a key press in VaM (e.g. Escape to skip the save-screenshot
+		/// prompt). Focuses the VaM window first so the key cannot land in another app, and
+		/// reports whether VaM actually held focus when the key was sent.</summary>
+		public JSONNode PressKey(JSONNode args) {
+			string key = S(args, "key");
+			if (key == "") throw new ApiError("key required, e.g. Escape, Return, Space, Tab, F5, a, Up");
+			int times = (int)Num(args, "times", 1);
+			if (times < 1) times = 1;
+			if (times > 50) times = 50;
+			bool focus = Bool(args, "focus", true);
+			byte vk = VirtualKey(key);
+			IntPtr hwnd = OwnWindow();
+			bool focused = false;
+			if (focus) {
+				focused = FocusOwnWindow(hwnd);
+				if (!focused) {
+					JSONClass f = new JSONClass();
+					f["ok"] = JSONRaw.Bool(false);
+					f["reason"] = "VaM window is not in the foreground; refusing to send keys that could reach another application";
+					f["hint"] = "Click the VaM window once, or set focus=false if you accept that risk.";
+					return f;
+				}
+				// A minimised/paused player does not run Update until focus has been back
+				// for a moment, so give it time to resume before the key is delivered.
+				Thread.Sleep(350);
+			}
+			for (int i = 0; i < times; i++) {
+				keybd_event(vk, 0, 0, UIntPtr.Zero);
+				Thread.Sleep(40);
+				keybd_event(vk, 0, KeyUp, UIntPtr.Zero);
+				Thread.Sleep(80);
+			}
+			JSONClass r = new JSONClass();
+			r["ok"] = JSONRaw.Bool(true);
+			r["key"] = key;
+			r["vk"] = JSONRaw.Num(vk);
+			r["times"] = JSONRaw.Num(times);
+			r["focused"] = JSONRaw.Bool(focused);
+			return r;
+		}
+
+		private static byte VirtualKey(string key) {
+			string k = key.Trim().ToLowerInvariant();
+			switch (k) {
+				case "escape": case "esc": return 0x1B;
+				case "return": case "enter": return 0x0D;
+				case "space": case "spacebar": return 0x20;
+				case "tab": return 0x09;
+				case "backspace": return 0x08;
+				case "delete": case "del": return 0x2E;
+				case "insert": return 0x2D;
+				case "home": return 0x24;
+				case "end": return 0x23;
+				case "pageup": case "pgup": return 0x21;
+				case "pagedown": case "pgdn": return 0x22;
+				case "up": return 0x26;
+				case "down": return 0x28;
+				case "left": return 0x25;
+				case "right": return 0x27;
+				case "shift": return 0x10;
+				case "ctrl": case "control": return 0x11;
+				case "alt": return 0x12;
+				case "menu": return 0x5D;
+			}
+			if (k.Length == 1) {
+				char c = k[0];
+				if (c >= 'a' && c <= 'z') return (byte)(0x41 + (c - 'a'));
+				if (c >= '0' && c <= '9') return (byte)(0x30 + (c - '0'));
+				throw new ApiError("unsupported key character: " + key);
+			}
+			if (k.StartsWith("f") && k.Length <= 3) {
+				int n;
+				if (int.TryParse(k.Substring(1), out n) && n >= 1 && n <= 12) return (byte)(0x70 + n - 1);
+			}
+			throw new ApiError("unsupported key name: " + key + " (try Escape, Return, Space, Tab, F1-F12, a-z, 0-9, arrows)");
 		}
 
 		// ===================== atoms =====================

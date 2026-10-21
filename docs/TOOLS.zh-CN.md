@@ -1,4 +1,4 @@
-# 工具参考（63 个）
+# 工具参考（64 个）
 
 *[English](TOOLS.md)*
 
@@ -20,6 +20,7 @@ VaM 运行时状态：插件版本、VaM 版本、原子/人物数量、端点�
 | `load_scene` | `path`*, `merge?` | 加载场景（`merge=true` 合并进当前场景）；支持 .var 包路径（`Package.1:/Saves/scene/x.json`） |
 | `new_scene` | — | 新建空场景（**丢弃当前场景**；空场景无默认灯光，记得打灯/开环境光） |
 | `save_scene` | `path?` | 保存场景（默认 `Saves/scene/VaMMCP_<时间戳>.json`；覆盖已存在文件会自动先删后存） |
+| `press_key` | `key`*、`times?`、`focus?` | 向 VaM 发送真实按键（Escape 可关闭保存截图对话框等模态提示）；无法切到 VaM 前景时拒绝发送 |
 
 ## Atom
 

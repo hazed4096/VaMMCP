@@ -26,6 +26,12 @@ namespace VaMMCP.Mcp {
 				.P("path", "string", "Optional save path (default Saves/scene/VaMMCP_<timestamp>.json)", false)
 				.Fn(api.SaveScene));
 
+			tools.Add(new Tool("press_key", "Send a real key press to VaM (Escape dismisses modal prompts such as the save-screenshot dialog). Brings the VaM window to the foreground first and refuses to send if it could not.")
+				.P("key", "string", "Key name: Escape, Return, Space, Tab, Backspace, Delete, Home, End, PageUp, PageDown, Up/Down/Left/Right, F1-F12, a-z, 0-9", true)
+				.P("times", "number", "How many times to press (default 1)", false)
+				.P("focus", "boolean", "Bring VaM to the foreground first (default true)", false)
+				.Fn(api.PressKey));
+
 			// ---------- atoms ----------
 			tools.Add(new Tool("list_atom_types", "List all atom types VaM can create, grouped by category.")
 				.Fn(a => api.ListAtomTypes()));
