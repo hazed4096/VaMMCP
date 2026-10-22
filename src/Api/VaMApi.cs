@@ -409,18 +409,21 @@ namespace VaMMCP.Api {
 		}
 
 		/// <summary>Synthesise a key press in VaM (e.g. Escape to skip the save-screenshot
-		/// prompt). Focuses the VaM window first so the key cannot land in another app, and
-		/// reports whether VaM actually held focus when the key was sent.</summary>
+		/// prompt). Never steals focus: by default the key is only sent while the user
+		/// already has VaM in the foreground (verified with GetForegroundWindow); otherwise
+		/// it refuses so the key cannot land in another application. focus=true is an
+		/// explicit opt-in to raising the VaM window first.</summary>
 		public JSONNode PressKey(JSONNode args) {
 			string key = S(args, "key");
 			if (key == "") throw new ApiError("key required, e.g. Escape, Return, Space, Tab, F5, a, Up");
 			int times = (int)Num(args, "times", 1);
 			if (times < 1) times = 1;
 			if (times > 50) times = 50;
-			bool focus = Bool(args, "focus", true);
+			bool focus = Bool(args, "focus", false);
 			byte vk = VirtualKey(key);
 			IntPtr hwnd = OwnWindow();
 			bool focused = false;
+			if (GetForegroundWindow() == hwnd) focused = true;
 			if (focus) {
 				focused = FocusOwnWindow(hwnd);
 				if (!focused) {
@@ -434,6 +437,13 @@ namespace VaMMCP.Api {
 				// for a moment. IdleSaver drops to 1 FPS while minimised, so wait longer
 				// than one frozen frame or the key is pressed and released between Updates.
 				Thread.Sleep(1200);
+			}
+			if (!focused) {
+				JSONClass f = new JSONClass();
+				f["ok"] = JSONRaw.Bool(false);
+				f["reason"] = "VaM does not have keyboard focus; keys would land in another application (keybd_event targets the foreground window)";
+				f["hint"] = "Click the VaM window once so it keeps focus (no window is raised automatically), then retry.";
+				return f;
 			}
 			for (int i = 0; i < times; i++) {
 				keybd_event(vk, 0, 0, UIntPtr.Zero);

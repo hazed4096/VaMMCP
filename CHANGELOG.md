@@ -18,6 +18,12 @@ All notable changes to this project are documented here. The format follows
   if it could not confirm VaM holds focus, so a stray key cannot land in another application.
 
 ### Fixed
+- **`press_key` no longer steals focus.** The default was to raise the VaM window
+  (`focus=true` via `SetForegroundWindow`) before every send, which yanked the user's
+  active window away. Now no window is raised automatically: the key is synthesised only
+  when VaM already holds the foreground focus (checked live, so a key can never land in
+  another application), and the tool refuses with a hint when VaM does not have focus.
+  `focus=true` remains as an explicit opt-in to raising the VaM window.
 - **`press_key` waits long enough for a resumed-but-slow player loop.** Restoring from the
   1 FPS minimised idle cap takes up to a second to run an `Update()`, so the previous
   350 ms settle (and the short synth key hold) could still lose the keypress; the settle

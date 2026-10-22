@@ -26,10 +26,10 @@ namespace VaMMCP.Mcp {
 				.P("path", "string", "Optional save path (default Saves/scene/VaMMCP_<timestamp>.json)", false)
 				.Fn(api.SaveScene));
 
-			tools.Add(new Tool("press_key", "Send a real key press to VaM (Escape dismisses modal prompts such as the save-screenshot dialog). Brings the VaM window to the foreground first and refuses to send if it could not.")
+			tools.Add(new Tool("press_key", "Send a real key press to VaM (Escape dismisses modal prompts such as the save-screenshot dialog). Never steals focus: the key is only sent while VaM already has keyboard focus, otherwise it refuses (focus=true opts in to raising the VaM window first).")
 				.P("key", "string", "Key name: Escape, Return, Space, Tab, Backspace, Delete, Home, End, PageUp, PageDown, Up/Down/Left/Right, F1-F12, a-z, 0-9", true)
 				.P("times", "number", "How many times to press (default 1)", false)
-				.P("focus", "boolean", "Bring VaM to the foreground first (default true)", false)
+				.P("focus", "boolean", "Raise the VaM window before sending (default false - no focus stealing)", false)
 				.Fn(api.PressKey));
 
 			// ---------- atoms ----------

@@ -21,7 +21,7 @@ VaM runtime status: plugin version, VaM version, atom/person counts, endpoint, e
 | `load_scene` | `path`*, `merge?` | Load a scene (`merge=true` merges into the current one); .var paths work (`Package.1:/Saves/scene/x.json`) |
 | `new_scene` | — | New empty scene (**discards the current one**; an empty scene has no lights — add one or raise ambient light) |
 | `save_scene` | `path?` | Save the scene (default `Saves/scene/VaMMCP_<timestamp>.json`; an existing file is removed first so the save is not swallowed by VaM's confirm dialog) |
-| `press_key` | `key`*, `times?`, `focus?` | Send a real key press to VaM (Escape dismisses modal prompts such as the save-screenshot dialog); refuses to send if VaM cannot be focused |
+| `press_key` | `key`*, `times?`, `focus?` | Send a real key press to VaM (Escape dismisses modal prompts such as the save-screenshot dialog); never steals focus - sends only while VaM already has focus, refuses otherwise (`focus=true` opts in to raising it) |
 
 ## Atom
 
