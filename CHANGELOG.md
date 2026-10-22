@@ -7,11 +7,22 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **URL parameter support across `list_storable_params` / `get_param` / `set_param`.**
+  Url params (VaM's `JSONStorableUrl`, e.g. the `customTexture_MainTex` /
+  `customTexture_AlphaTex` texture slots on clothing materials) were invisible and could
+  not be written, which blocked any texture-based customisation. `list_storable_params`
+  now reports a `urls` section, `get_param` reads them, `set_param` sets them with
+  `type:"url"` (auto-detected; pass `reload=false` to skip reloading an unchanged path).
 - `press_key` tool: sends a real key press to VaM (Escape dismisses modal prompts such as the
   save-screenshot dialog). It brings the VaM window to the foreground first and refuses to send
   if it could not confirm VaM holds focus, so a stray key cannot land in another application.
 
 ### Fixed
+- **`press_key` waits long enough for a resumed-but-slow player loop.** Restoring from the
+  1 FPS minimised idle cap takes up to a second to run an `Update()`, so the previous
+  350 ms settle (and the short synth key hold) could still lose the keypress; the settle
+  is now 1.2 s and the key is held/released longer, so Escape reliably dismisses the
+  save-screenshot prompt right after an un-minimise.
 - **`press_key` now restores a minimised VaM window and waits for the player loop to
   resume before sending the key.** A minimised VaM does not run `Update()`, so the key
   was delivered but never read and the save-screenshot prompt stayed up. It also fixes

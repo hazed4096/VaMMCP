@@ -431,14 +431,15 @@ namespace VaMMCP.Api {
 					return f;
 				}
 				// A minimised/paused player does not run Update until focus has been back
-				// for a moment, so give it time to resume before the key is delivered.
-				Thread.Sleep(350);
+				// for a moment. IdleSaver drops to 1 FPS while minimised, so wait longer
+				// than one frozen frame or the key is pressed and released between Updates.
+				Thread.Sleep(1200);
 			}
 			for (int i = 0; i < times; i++) {
 				keybd_event(vk, 0, 0, UIntPtr.Zero);
-				Thread.Sleep(40);
+				Thread.Sleep(120);
 				keybd_event(vk, 0, KeyUp, UIntPtr.Zero);
-				Thread.Sleep(80);
+				Thread.Sleep(150);
 			}
 			JSONClass r = new JSONClass();
 			r["ok"] = JSONRaw.Bool(true);
@@ -1566,6 +1567,17 @@ namespace VaMMCP.Api {
 			}
 			r["strings"] = strings;
 
+			JSONArray urls = new JSONArray();
+			foreach (string n in SortedNames(st.GetUrlParamNames())) {
+				try {
+					JSONClass p = new JSONClass();
+					p["name"] = n;
+					p["value"] = st.GetUrlParamValue(n);
+					urls.Add(p);
+				} catch (Exception e) { Log.Debug("url param " + n + ": " + e.Message); }
+			}
+			r["urls"] = urls;
+
 			JSONArray choosers = new JSONArray();
 			foreach (string n in SortedNames(st.GetStringChooserParamNames())) {
 				try {
@@ -1813,6 +1825,9 @@ namespace VaMMCP.Api {
 			} else if (st.GetBoolParamNames().Contains(name)) {
 				r["type"] = "bool";
 				r["value"] = JSONRaw.Bool(st.GetBoolParamValue(name));
+			} else if (st.IsUrlJSONParam(name)) {
+				r["type"] = "url";
+				r["value"] = st.GetUrlParamValue(name);
 			} else if (st.GetStringParamNames().Contains(name)) {
 				r["type"] = "string";
 				r["value"] = st.GetStringParamValue(name);
@@ -1852,6 +1867,7 @@ namespace VaMMCP.Api {
 			if (type == "" || type == "auto") {
 				if (st.GetFloatParamNames().Contains(name)) type = "float";
 				else if (st.GetBoolParamNames().Contains(name)) type = "bool";
+				else if (st.IsUrlJSONParam(name)) type = "url";
 				else if (st.GetStringParamNames().Contains(name)) type = "string";
 				else if (st.GetStringChooserParamNames().Contains(name)) type = "chooser";
 				else if (st.GetColorParamNames().Contains(name)) type = "color";
@@ -1877,6 +1893,17 @@ namespace VaMMCP.Api {
 					r["type"] = "string";
 					r["value"] = st.GetStringParamValue(name);
 					break;
+				case "url": {
+					string url = value.Value;
+					st.SetUrlParamValue(name, url);
+					JSONStorableUrl urlParam = st.GetUrlJSONParam(name);
+					r["type"] = "url";
+					if (urlParam != null && url != "" && (args["reload"] == null || args["reload"].AsBool)) {
+						urlParam.Reload();
+					}
+					r["value"] = st.GetUrlParamValue(name);
+					break;
+				}
 				case "chooser":
 					st.SetStringChooserParamValue(name, value.Value);
 					r["type"] = "chooser";
@@ -1897,7 +1924,7 @@ namespace VaMMCP.Api {
 					break;
 				}
 				default:
-					throw new ApiError("cannot determine param type for " + name + "; specify type: float|bool|string|chooser|color|property");
+					throw new ApiError("cannot determine param type for " + name + "; specify type: float|bool|string|url|chooser|color|property");
 			}
 			return r;
 		}

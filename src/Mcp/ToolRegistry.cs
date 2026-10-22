@@ -211,21 +211,22 @@ namespace VaMMCP.Mcp {
 			tools.Add(new Tool("list_atom_storables", "List every storable (sub-component with params) of an atom.")
 				.P("uid", "string", "Atom uid", true)
 				.Fn(api.ListAtomStorables));
-			tools.Add(new Tool("list_storable_params", "Introspect a storable: all float/bool/string/chooser/color params (with ranges, choices) and actions. This is how an agent can control ANY VaM slider.")
+			tools.Add(new Tool("list_storable_params", "Introspect a storable: all float/bool/string/url/chooser/color params (with ranges, choices) and actions. Url params include custom texture slots (e.g. customTexture_MainTex, customTexture_AlphaTex). This is how an agent can control ANY VaM slider.")
 				.P("uid", "string", "Atom uid", true)
 				.P("storable", "string", "Storable id from list_atom_storables", true)
 				.Fn(api.ListStorableParams));
-			tools.Add(new Tool("get_param", "Read a single param value (float|bool|string|chooser|color).")
+			tools.Add(new Tool("get_param", "Read a single param value (float|bool|string|url|chooser|color).")
 				.P("uid", "string", "Atom uid", true)
 				.P("storable", "string", "Storable id", true)
 				.P("param", "string", "Param name", true)
 				.Fn(api.GetParam));
-			tools.Add(new Tool("set_param", "Set a single param value. Type is auto-detected; pass type to force (float|bool|string|chooser|color|property). 'property' writes a public property/field of the storable (covers custom params like gravityX). Colors accept #RRGGBB or r,g,b,a.")
+			tools.Add(new Tool("set_param", "Set a single param value. Type is auto-detected; pass type to force (float|bool|string|url|chooser|color|property). 'url' sets a file/image url and reloads it (pass reload=false to skip); 'property' writes a public property/field of the storable (covers custom params like gravityX). Colors accept #RRGGBB or r,g,b,a.")
 				.P("uid", "string", "Atom uid", true)
 				.P("storable", "string", "Storable id", true)
 				.P("param", "string", "Param name", true)
 				.P("value", "any", "Value to set", true)
 				.P("type", "string", "Optional type override", false)
+				.P("reload", "bool", "For url params: reload the file after setting (default true)", false)
 				.Fn(api.SetParam));
 			tools.Add(new Tool("call_action", "Invoke an action button of a storable (e.g. Reset, Stop, Play).")
 				.P("uid", "string", "Atom uid", true)

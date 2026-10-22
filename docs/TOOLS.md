@@ -100,12 +100,12 @@ VaM runtime status: plugin version, VaM version, atom/person counts, endpoint, e
 | Tool | Arguments | Notes |
 | --- | --- | --- |
 | `list_atom_storables` | `uid`* | Every storable on an atom, with its type |
-| `list_storable_params` | `uid`*, `storable`* | Parameter introspection: floats (with min/max/default) / bools / strings / choosers / colors / actions / customParams / properties |
-| `get_param` | `uid`*, `storable`*, `param`* | Read a parameter (float/bool/string/chooser/color/property auto-detected) |
-| `set_param` | `uid`*, `storable`*, `param`*, `value`*, `type?` | Write a parameter (colors accept `#RRGGBB` or `r,g,b,a`) |
+ | `list_storable_params` | `uid`*, `storable`* | Parameter introspection: floats (with min/max/default) / bools / strings / urls / choosers / colors / actions / customParams / properties |
+| `get_param` | `uid`*, `storable`*, `param`* | Read one value (float/bool/string/url/chooser/color, falls back to public properties) |
+| `set_param` | `uid`*, `storable`*, `param`*, `value`*, `type?`, `reload?` | Write a parameter (colors accept `#RRGGBB` or `r,g,b,a`; url params set file/image urls and reload them unless `reload=false`) |
 | `call_action` | `uid`*, `storable`*, `action`* | Trigger a storable action (a button in the UI) |
 
-`type` can force the interpretation: `float|bool|string|chooser|color|property`
+`type` can force the interpretation: `float|bool|string|url|chooser|color|property`
 (`property` reads/writes a public property through reflection, covering customParamNames such as `gravityX`).
 
 ## Camera

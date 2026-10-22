@@ -99,12 +99,12 @@ VaM 运行时状态：插件版本、VaM 版本、原子/人物数量、端点�
 | 工具 | 参数 | 说明 |
 | --- | --- | --- |
 | `list_atom_storables` | `uid`* | 原子全部 storable（含类型） |
-| `list_storable_params` | `uid`*, `storable`* | 参数内省：floats（含 min/max/default）/bools/strings/choosers/colors/actions/customParams/properties |
-| `get_param` | `uid`*, `storable`*, `param`* | 读参数（float/bool/string/chooser/color/property 自动识别） |
-| `set_param` | `uid`*, `storable`*, `param`*, `value`*, `type?` | 写参数（颜色支持 `#RRGGBB` 或 `r,g,b,a`） |
+| `list_storable_params` | `uid`*, `storable`* | 参数内省：floats（含 min/max/default）/bools/strings/urls/choosers/colors/actions/customParams/properties |
+| `get_param` | `uid`*, `storable`*, `param`* | 读参数（float/bool/string/url/chooser/color/property 自动识别） |
+| `set_param` | `uid`*, `storable`*, `param`*, `value`*, `type?`, `reload?` | 写参数（颜色支持 `#RRGGBB` 或 `r,g,b,a`；url 参数设置文件/图片路径并默认重新加载，传 `reload=false` 跳过） |
 | `call_action` | `uid`*, `storable`*, `action`* | 触发 storable 的动作（按钮） |
 
-`type` 可强制指定：`float|bool|string|chooser|color|property`（`property` 走反射读写公共属性，覆盖 customParamNames 如 `gravityX`）。
+`type` 可强制指定：`float|bool|string|url|chooser|color|property`（`property` 走反射读写公共属性，覆盖 customParamNames 如 `gravityX`）。
 
 ## 相机
 
