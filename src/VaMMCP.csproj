@@ -13,10 +13,10 @@
       VaM install root. Override at build time with:
         dotnet build -p:VaMRoot=D:\path\to\VaM
       or set the VAM_ROOT environment variable (scripts/deploy.sh reads it).
-      Default: two levels above this file (i.e. the VaM folder when the repo sits inside it).
+      Default: the VaM_1.22.0.3 folder next to this repo (VaMRoot layout).
     -->
     <VaMRoot Condition="'$(VaMRoot)' == '' and '$(VAM_ROOT)' != ''">$(VAM_ROOT)</VaMRoot>
-    <VaMRoot Condition="'$(VaMRoot)' == ''">..\..</VaMRoot>
+    <VaMRoot Condition="'$(VaMRoot)' == ''">..\..\VaM_1.22.0.3</VaMRoot>
   </PropertyGroup>
 
   <ItemGroup>

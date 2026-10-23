@@ -32,6 +32,10 @@ namespace VaMMCP.Mcp {
 				.P("focus", "boolean", "Raise the VaM window before sending (default false - no focus stealing)", false)
 				.Fn(api.PressKey));
 
+			tools.Add(new Tool("ui_hud", "Hide or show VaM's main HUD (launcher panels: Hub, scene browser, Create). Use action=hide to look through to the scene view for captures while VaM stays unfocused; action=show to bring the panels back.")
+				.P("action", "string", "hide or show", true)
+				.Fn(api.UiHud));
+
 			// ---------- atoms ----------
 			tools.Add(new Tool("list_atom_types", "List all atom types VaM can create, grouped by category.")
 				.Fn(a => api.ListAtomTypes()));
@@ -242,11 +246,14 @@ namespace VaMMCP.Mcp {
 				.P("rotation", "array", "[x, y, z] euler angles", false)
 				.P("fov", "number", "Field of view in degrees", false)
 				.Fn(api.SetCamera));
-			tools.Add(new Tool("capture_view", "Render the monitor camera to a PNG file (default Saves/PluginData/vam-mcp/preview.png) and return its path. Set return_image=true to also get the picture back inline, for clients that cannot read the VaM folder themselves.")
-				.P("width", "number", "Image width (default 1280, max 4096)", false)
+			tools.Add(new Tool("capture_view", "Capture what VaM actually renders on screen to a PNG (default Saves/PluginData/vam-mcp/preview.png) and return its path. mode=window (default) grabs the real back buffer, so person skin/clothing render; it completes at end of the next frame, so the tool polls (up to timeout_ms - idle VaM frames can take seconds). mode=camera does the old RenderTexture re-render of the monitor camera only (fast, but person meshes may be missing). Set return_image=true to also get the picture back inline.")
+				.P("width", "number", "Image width (default 1280, max 4096; window mode scales the full buffer down to this)", false)
 				.P("height", "number", "Image height (default 720, max 4096)", false)
 				.P("path", "string", "Optional output path", false)
+				.P("mode", "string", "'window' (default, full fidelity) or 'camera' (legacy fast re-render)", false)
 				.P("return_image", "boolean", "Return the PNG inline as an MCP image (default false; keep the resolution modest, e.g. 640x360, and note that images above 4 MB stay on disk only)", false)
+				.P("timeout_ms", "number", "How long to wait for the next rendered frame in window mode (default 20000)", false)
+				.Timeout(60000).Poller()
 				.Fn(api.CaptureView));
 
 			// ---------- simulation ----------
@@ -256,6 +263,207 @@ namespace VaMMCP.Mcp {
 				.Fn(api.SetSimulation));
 			tools.Add(new Tool("reset_simulation", "Reset the physics simulation (collapses soft-body / cloth jitter).")
 				.Fn(a => api.ResetSimulation()));
+
+			// ---------- scene animation / timeline ----------
+			tools.Add(new Tool("list_animation_patterns", "List AnimationPattern atoms in the scene (each manages a timeline of AnimationSteps).")
+				.P("search", "string", "Optional uid/name filter", false)
+				.Fn(api.ListAnimationPatterns));
+			tools.Add(new Tool("list_animation_steps", "List AnimationStep atoms for a given AnimationPattern.")
+				.P("pattern_uid", "string", "AnimationPattern atom uid", true)
+				.Fn(api.ListAnimationSteps));
+			tools.Add(new Tool("create_animation_pattern", "Create a new AnimationPattern atom (timeline container).")
+				.P("uid", "string", "Optional uid", false)
+				.Timeout(30000).Poller()
+				.Fn(api.CreateAnimationPattern));
+			tools.Add(new Tool("create_animation_step", "Create an AnimationStep atom and attach it to an AnimationPattern.")
+				.P("pattern_uid", "string", "AnimationPattern atom uid", true)
+				.P("uid", "string", "Optional uid", false)
+				.P("transition_type", "string", "Transition type: Linear, Smooth, etc.", false)
+				.P("duration", "number", "Step duration in seconds", false)
+				.Timeout(30000).Poller()
+				.Fn(api.CreateAnimationStep));
+			tools.Add(new Tool("animation_pattern_action", "Control an AnimationPattern: Play, Stop, Pause, Reset, Scrub.")
+				.P("pattern_uid", "string", "AnimationPattern atom uid", true)
+				.P("action", "string", "Action: Play, Stop, Pause, Reset, ScrubToTime, SetTime", true)
+				.P("time", "number", "Time value for ScrubToTime/SetTime", false)
+				.Fn(api.AnimationPatternAction));
+			tools.Add(new Tool("animation_step_action", "Control an AnimationStep: Play, Stop, SetTransition, SetDuration.")
+				.P("step_uid", "string", "AnimationStep atom uid", true)
+				.P("action", "string", "Action: Play, Stop, SetTransition, SetDuration", true)
+				.P("value", "number", "Value for SetTransition (index) or SetDuration (seconds)", false)
+				.Fn(api.AnimationStepAction));
+			tools.Add(new Tool("record_scene_animation", "Start/stop recording a scene animation (records atom transforms to AnimationSteps).")
+				.P("pattern_uid", "string", "AnimationPattern to record into", true)
+				.P("action", "string", "Start or Stop", true)
+				.P("record_physics", "boolean", "Record physics-driven atoms too", false)
+				.Fn(api.RecordSceneAnimation));
+
+			// ---------- triggers ----------
+			tools.Add(new Tool("list_triggers", "List trigger-carrying atoms in the scene (Trigger storables on sliders/buttons/steps).")
+				.P("search", "string", "Optional uid/storable filter", false)
+				.Fn(api.ListTriggers));
+			tools.Add(new Tool("trigger_action", "Fire or configure a trigger: Fire, Reset, SetParams.")
+				.P("trigger_uid", "string", "Trigger atom uid", true)
+				.P("action", "string", "Action: Fire, Reset, SetFloatParam, SetStringParam", true)
+				.P("param", "string", "Parameter name", false)
+				.P("value", "any", "Value to set", false)
+				.Fn(api.TriggerAction));
+			tools.Add(new Tool("create_trigger", "Create a new Trigger atom.")
+				.P("uid", "string", "Optional uid", false)
+				.Timeout(30000).Poller()
+				.Fn(api.CreateTrigger));
+
+			// ---------- physics ----------
+			tools.Add(new Tool("list_physics_objects", "List physics-relevant atoms (their physics-ish storables by name).")
+				.P("search", "string", "Optional uid filter", false)
+				.Fn(api.ListPhysicsObjects));
+			tools.Add(new Tool("physics_object_action", "Control a physics object: Enable/Disable, SetCollision, AddForce, SetMass.")
+				.P("uid", "string", "Physics atom uid", true)
+				.P("action", "string", "Action: EnablePhysics, DisablePhysics, SetCollision, AddForce, SetMass, SetDrag", true)
+				.P("value", "any", "Value for the action", false)
+				.Fn(api.PhysicsObjectAction));
+			tools.Add(new Tool("create_physics_joint", "Create a physics joint between two atoms (ConfigurableJoint, FixedJoint, SpringJoint).")
+				.P("uid", "string", "Optional uid", false)
+				.P("atom_a", "string", "First atom uid", true)
+				.P("atom_b", "string", "Second atom uid", true)
+				.P("joint_type", "string", "ConfigurableJoint, FixedJoint, SpringJoint, HingeJoint", true)
+				.P("anchor", "array", "[x,y,z] local anchor on atom A", false)
+				.P("connected_anchor", "array", "[x,y,z] local anchor on atom B", false)
+				.Timeout(30000).Poller()
+				.Fn(api.CreatePhysicsJoint));
+
+			// ---------- scene lighting / audio / misc ----------
+			tools.Add(new Tool("list_lights", "List Light atoms in the scene with their current settings.")
+				.Fn(api.ListLights));
+			tools.Add(new Tool("light_action", "Control a Light: On/Off, SetColor, SetIntensity, SetRange, SetType.")
+				.P("uid", "string", "Light atom uid", true)
+				.P("action", "string", "Action: Toggle, SetColor, SetIntensity, SetRange, SetType, SetSpotAngle", true)
+				.P("value", "any", "Value (color hex, float, or string for type)", false)
+				.Fn(api.LightAction));
+			tools.Add(new Tool("list_audio_sources", "List AudioSource atoms.")
+				.Fn(api.ListAudioSources));
+			tools.Add(new Tool("audio_source_action", "Control AudioSource: Play, Stop, Pause, SetVolume, SetClip, SetLoop.")
+				.P("uid", "string", "AudioSource atom uid", true)
+				.P("action", "string", "Action: Play, Stop, Pause, SetVolume, SetClip, SetLoop", true)
+				.P("value", "any", "Value for the action", false)
+				.Fn(api.AudioSourceAction));
+
+			// ---------- user preferences ----------
+			tools.Add(new Tool("get_user_preferences", "Get current UserPreferences (graphics, performance, VR, navigation, security, etc.).")
+				.P("category", "string", "Optional category filter", false)
+				.Fn(api.GetUserPreferences));
+			tools.Add(new Tool("set_user_preferences", "Set UserPreferences value.")
+				.P("key", "string", "Preference key (e.g. 'renderScale', 'vrMirrorMode', 'autoSaveInterval')", true)
+				.P("value", "any", "Value to set", true)
+				.Fn(api.SetUserPreferences));
+
+			// ---------- scene browser / template browser ----------
+			tools.Add(new Tool("scene_browser", "Open/control the Scene Browser: List, Load, New, Save, Delete scenes.")
+				.P("action", "string", "Action: List, Load, New, Save, Delete, Refresh", true)
+				.P("path", "string", "Scene path for Load/Save/Delete", false)
+				.Fn(api.SceneBrowser));
+			tools.Add(new Tool("template_browser", "Open/control the Template Browser: List, Load templates.")
+				.P("action", "string", "Action: List, Load", true)
+				.P("category", "string", "Template category filter", false)
+				.Fn(api.TemplateBrowser));
+
+			// ---------- atom UI (control, move, geometry, physics) ----------
+			tools.Add(new Tool("atom_control", "Control atom state: IsolateEdit, FreezePhysics, DisableRender, DisableCollision, Select, EndIsolate.")
+				.P("uid", "string", "Atom uid", true)
+				.P("action", "string", "Action: IsolateEdit, FreezePhysics, DisableRender, DisableCollision, Select, EndIsolate, SetNameSpace", true)
+				.P("value", "any", "Value for SetNameSpace", false)
+				.Fn(api.AtomControl));
+			tools.Add(new Tool("atom_move", "Move atom with gizmo: SetPosition, SetRotation, SetScale, SnapToGround, AlignTo.")
+				.P("uid", "string", "Atom uid", true)
+				.P("action", "string", "Action: SetPosition, SetRotation, SetScale, SnapToGround, AlignTo, ResetTransform", true)
+				.P("target_uid", "string", "Target atom for AlignTo", false)
+				.P("value", "array", "[x,y,z] for position/rotation/scale", false)
+				.Fn(api.AtomMove));
+			tools.Add(new Tool("atom_geometry_choices", "Get/set atom geometry choices (for CustomUnityAsset, etc.).")
+				.P("uid", "string", "Atom uid", true)
+				.P("action", "string", "Action: List, Select", true)
+				.P("choice", "string", "Choice name for Select", false)
+				.Fn(api.AtomGeometryChoices));
+
+			// ---------- person animation ----------
+			tools.Add(new Tool("person_animation", "Control Person animation recording/playback: ArmRecord, PlaybackEnabled, RecordAnimation, PlayAnimation.")
+				.P("person", "string", "Person uid", false)
+				.P("action", "string", "Action: ArmRecord, PlaybackEnabled, RecordAnimation, PlayAnimation, StopAnimation", true)
+				.P("value", "boolean", "true/false for ArmRecord/PlaybackEnabled", false)
+				.Fn(api.PersonAnimation));
+
+			// ---------- custom unity assets ----------
+			tools.Add(new Tool("list_cua", "List CustomUnityAsset atoms with their assetUrl, assetName, and load state.")
+				.Fn(api.ListCUA));
+			tools.Add(new Tool("cua_action", "Control CustomUnityAsset: LoadAsset, UnloadAsset, ReloadAsset, SetAssetUrl, SetAssetName.")
+				.P("uid", "string", "CUA atom uid", true)
+				.P("action", "string", "Action: LoadAsset, UnloadAsset, ReloadAsset, SetAssetUrl, SetAssetName", true)
+				.P("value", "string", "Asset URL or asset name", false)
+				.Fn(api.CUAAction));
+
+			// ---------- package manager ----------
+			tools.Add(new Tool("package_manager", "Local package management: ScanPackages, RefreshPackages, EnablePackage, DisablePackage, DeletePackage.")
+				.P("action", "string", "Action: ScanPackages, RefreshPackages, EnablePackage, DisablePackage, DeletePackage, ListEnabled", true)
+				.P("package", "string", "Package uid for Enable/Disable/Delete", false)
+				.Fn(api.PackageManager));
+
+			// ---------- triggers (extended) ----------
+			tools.Add(new Tool("trigger_ui", "Open/control Trigger UI panel for a trigger atom.")
+				.P("trigger_uid", "string", "Trigger atom uid", true)
+				.P("action", "string", "Action: Show, Hide, Refresh", true)
+				.Fn(api.TriggerUI));
+
+			// ---------- person hand control / skin / materials ----------
+			tools.Add(new Tool("person_hand_control", "Control hand IK/targeting: SetTarget, SetWeight, SetRotation, AutoGrasp.")
+				.P("person", "string", "Person uid", false)
+				.P("hand", "string", "left or right", true)
+				.P("action", "string", "Action: SetTarget, SetWeight, SetRotation, AutoGrasp, Release", true)
+				.P("target_uid", "string", "Target atom uid for SetTarget", false)
+				.P("value", "number", "Weight (0-1) or rotation value", false)
+				.Fn(api.PersonHandControl));
+			tools.Add(new Tool("person_material", "Get/set person material parameters (skin, genitals, eyes, etc.).")
+				.P("person", "string", "Person uid", false)
+				.P("material", "string", "Material name: skin, genitals, eyes, mouth, nails, etc.", true)
+				.P("action", "string", "Action: GetParam, SetParam, ListParams", true)
+				.P("param", "string", "Parameter name", false)
+				.P("value", "any", "Value for SetParam", false)
+				.Fn(api.PersonMaterial));
+
+			// ---------- scene state inspection / debugging ----------
+			tools.Add(new Tool("scene_state", "Get comprehensive current scene state: atoms, persons, plugins, physics, simulation, performance.")
+				.P("detail", "string", "Detail level: summary, full, physics, plugins, persons", false)
+				.Fn(api.SceneState));
+			tools.Add(new Tool("atom_tree", "Get hierarchical atom tree with parent/child relationships and transforms.")
+				.P("root_uid", "string", "Optional root atom uid (default: all)", false)
+				.P("max_depth", "number", "Maximum depth to traverse", false)
+				.Fn(api.AtomTree));
+			tools.Add(new Tool("person_state", "Get detailed person state: morphs, clothing, hair, controls, physics, expressions.")
+				.P("person", "string", "Person uid (default: first)", false)
+				.P("include_hidden", "boolean", "Include zero/non-active items", false)
+				.Fn(api.PersonState));
+			tools.Add(new Tool("physics_state", "Get physics engine state: active rigidbodies, joints, collisions, performance.")
+				.Fn(a => api.PhysicsState()));
+			tools.Add(new Tool("simulation_performance", "Get simulation performance metrics: frame time, physics time, atom counts, memory.")
+				.Fn(a => api.SimulationPerformance()));
+			tools.Add(new Tool("find_atoms", "Find atoms by various criteria: name, type, component, property, tag.")
+				.P("name", "string", "Name substring filter", false)
+				.P("type", "string", "Atom type filter", false)
+				.P("component", "string", "Component type name filter", false)
+				.P("property", "string", "Property name to check", false)
+				.P("value", "any", "Property value to match", false)
+				.P("tag", "string", "Tag filter", false)
+				.Fn(api.FindAtoms));
+			tools.Add(new Tool("storable_diff", "Compare two storables or two atoms' storables and show differences.")
+				.P("uid_a", "string", "First atom uid", true)
+				.P("storable_a", "string", "First storable id", true)
+				.P("uid_b", "string", "Second atom uid", true)
+				.P("storable_b", "string", "Second storable id", true)
+				.Fn(api.StorableDiff));
+			tools.Add(new Tool("scene_dependencies", "Analyze scene dependencies: missing packages, broken references, missing assets.")
+				.Fn(a => api.SceneDependencies()));
+			tools.Add(new Tool("performance_profile", "Run a short performance profile: frame times, GC, physics, render, scripts.")
+				.P("duration_ms", "number", "Profile duration in ms (default 5000)", false)
+				.Fn(api.PerformanceProfile));
 
 			// ---------- hub / community resources ----------
 			tools.Add(new Tool("hub_browse", "Browse the VaM Hub (community content: looks, clothing, scenes, plugins...). Queries the game's own Hub API.")

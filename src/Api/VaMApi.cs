@@ -408,6 +408,23 @@ namespace VaMMCP.Api {
 			return found;
 		}
 
+		/// <summary>Show or hide VaM's main HUD (the launcher panels over the scene view)
+		/// so captures can see the scene while VaM is unfocused. Equivalent to the
+		/// scene-view <-> main-screen switch; uses SuperController's own methods,
+		/// no window focus changes.</summary>
+		public JSONNode UiHud(JSONNode args) {
+			string action = S(args, "action");
+			if (action != "hide" && action != "show") throw new ApiError("action required: hide or show");
+			JSONClass r = new JSONClass();
+			Mt.Run(delegate {
+				if (action == "hide") SC.HideMainHUD();
+				else SC.ShowMainHUD();
+			}, 10000);
+			r["action"] = action;
+			r["ok"] = JSONRaw.Bool(true);
+			return r;
+		}
+
 		/// <summary>Synthesise a key press in VaM (e.g. Escape to skip the save-screenshot
 		/// prompt). Never steals focus: by default the key is only sent while the user
 		/// already has VaM in the foreground (verified with GetForegroundWindow); otherwise
@@ -1984,7 +2001,91 @@ namespace VaMMCP.Api {
 		/// <summary>Largest PNG returned inline as base64 (bigger images stay on disk only).</summary>
 		private const int MaxInlineImageBytes = 4 * 1024 * 1024;
 
+		private static volatile PreviewGrabber grabber;
+
+		/// <summary>Attach the back-buffer grabber to the monitor camera, once.</summary>
+		private static PreviewGrabber Grabber() {
+			if (grabber != null) return grabber;
+			GameObject go = MonitorCamera().gameObject;
+			PreviewGrabber existing = go.GetComponent<PreviewGrabber>();
+			if (existing != null) { grabber = existing; return grabber; }
+			grabber = go.AddComponent<PreviewGrabber>();
+			return grabber;
+		}
+
+		/// <summary>
+		/// Capture the real window back buffer (what VaM renders on screen, so person
+		/// skin/clothing are included - a plain cam.Render() drops DAZCharacter meshes,
+		/// which is why captures used to show floating hair and cuffs on empty walls).
+		/// The grab happens at the end of the frame, so the handler (HTTP thread) schedules
+		/// it on the main thread and then polls for the sequence bump. One frame may be
+		/// several seconds on an idle VaM (IdleSaver's 1 fps), hence the 20 s default poll.
+		/// </summary>
 		public JSONNode CaptureView(JSONNode args) {
+			string mode = S(args, "mode");
+			if (mode == "") mode = "window";
+			if (mode == "camera") return CaptureViewCamera(args);
+			if (mode != "window") throw new ApiError("mode must be 'window' (default) or 'camera'");
+
+			int w = (int)Num(args, "width", 1280);
+			int h = (int)Num(args, "height", 720);
+			if (w < 64 || h < 64) throw new ApiError("width/height too small");
+			if (w > 4096 || h > 4096) throw new ApiError("width/height too large (max 4096)");
+			bool returnImage = Bool(args, "return_image", false);
+			string path = S(args, "path");
+			if (path == "") path = "Saves/PluginData/vam-mcp/preview.png";
+			int timeoutMs = (int)Num(args, "timeout_ms", 20000);
+
+			// Schedule the grab on the main thread, then poll PreviewGrabber fields
+			// from this HTTP thread (both sides use volatile/Interlocked accessors).
+			long startSeq = 0;
+			bool done = false;
+			PreviewGrabber g = Mt.Run(delegate {
+				PreviewGrabber gg = Grabber();
+				startSeq = Interlocked.Read(ref gg.lastSeq);
+				gg.reqWidth = w;
+				gg.reqHeight = h;
+				gg.reqPath = path;
+				gg.lastBytes = null;
+				gg.lastError = null;
+				gg.pending = true;
+				return gg;
+			});
+
+			JSONClass r = new JSONClass();
+			r["mode"] = "window";
+			r["path"] = path;
+			r["width"] = JSONRaw.Num(w);
+			r["height"] = JSONRaw.Num(h);
+			long deadline = Environment.TickCount + timeoutMs;
+			while (Environment.TickCount < deadline) {
+				Thread.Sleep(50);
+				if (Interlocked.Read(ref g.lastSeq) != startSeq) { done = true; break; }
+				if (g.lastError != null) break; // grab attempt errored (volatile read)
+			}
+			string err = g.lastError;
+			if (done && err == null) {
+				r["pending"] = JSONRaw.Bool(false);
+				byte[] lastBytes = g.lastBytes;
+				int pngBytes = lastBytes != null ? lastBytes.Length : 0;
+				r["bytes"] = JSONRaw.Num(pngBytes);
+				r["actual_width"] = JSONRaw.Num(g.lastWidth);
+				r["actual_height"] = JSONRaw.Num(g.lastHeight);
+				if (returnImage && lastBytes != null && lastBytes.Length <= MaxInlineImageBytes) {
+					r["image_base64"] = Convert.ToBase64String(lastBytes);
+					r["image_mime"] = "image/png";
+				} else if (returnImage && lastBytes != null) {
+					r["note"] = "image too large to inline (" + pngBytes + " bytes); read it from path instead";
+				}
+			} else {
+				r["pending"] = JSONRaw.Bool(true);
+				if (err != null) r["note"] = "grab error (file path may still be from an older capture): " + err;
+				else r["note"] = "no frame rendered within " + timeoutMs + " ms (is VaM minimized, or IdleEaver holding the sim at 1 fps?) - read the file after a delay instead";
+			}
+			return r;
+		}
+
+		public JSONNode CaptureViewCamera(JSONNode args) {
 			Camera cam = MonitorCamera();
 			int w = (int)Num(args, "width", 1280);
 			int h = (int)Num(args, "height", 720);
@@ -2019,6 +2120,7 @@ namespace VaMMCP.Api {
 				rt.Release();
 			}
 			JSONClass r = new JSONClass();
+			r["mode"] = "camera";
 			r["path"] = path;
 			r["width"] = JSONRaw.Num(w);
 			r["height"] = JSONRaw.Num(h);
@@ -2054,6 +2156,1871 @@ namespace VaMMCP.Api {
 			JSONClass r = new JSONClass();
 			r["ok"] = JSONRaw.Bool(true);
 			return r;
+		}
+
+		// ===================== generic helpers for the extended tools =====================
+
+		/// <summary>Case-insensitive action lookup; returns null if absent so the caller can build a helpful error.</summary>
+		private static JSONStorableAction FindActionCI(JSONStorable st, string wanted) {
+			if (st == null || wanted == "") return null;
+			JSONStorableAction a = st.GetAction(wanted);
+			if (a != null) return a;
+			try {
+				foreach (string n in st.GetActionNames()) {
+					if (string.Equals(n, wanted, StringComparison.OrdinalIgnoreCase)) return st.GetAction(n);
+				}
+			} catch { }
+			return null;
+		}
+
+		private static string ActionHelp(JSONStorable st) {
+			List<string> names = new List<string>();
+			try { foreach (string n in st.GetActionNames()) names.Add(n); } catch { }
+			return names.Count > 0 ? "available actions: " + string.Join(", ", names.ToArray()) : "no actions on this storable";
+		}
+
+		/// <summary>Find a storable on an atom by exact id, then by case-insensitive exact, then by substring; null if none match.</summary>
+		private static JSONStorable ResolveStorable(Atom a, string sid, string contains, out string usedId) {
+			usedId = sid;
+			if (sid != "") {
+				JSONStorable st = a.GetStorableByID(sid);
+				if (st != null) return st;
+				foreach (string id in a.GetStorableIDs()) {
+					if (string.Equals(id, sid, StringComparison.OrdinalIgnoreCase)) {
+						JSONStorable s2 = a.GetStorableByID(id);
+						if (s2 != null) { usedId = id; return s2; }
+					}
+				}
+			}
+			if (contains != null) {
+				foreach (string id in a.GetStorableIDs()) {
+					if (id.IndexOf(contains, StringComparison.OrdinalIgnoreCase) >= 0) {
+						JSONStorable s3 = a.GetStorableByID(id);
+						if (s3 != null) { usedId = id; return s3; }
+					}
+				}
+			}
+			return null;
+		}
+
+		private static JSONStorable RequireResolvedStorable(Atom a, string sid, string contains, string what) {
+			string used;
+			JSONStorable st = ResolveStorable(a, sid, contains, out used);
+			if (st == null) {
+				StringBuilder sb = new StringBuilder();
+				sb.Append(what).Append(" storable not found on ").Append(a.uid);
+				if (sid != "") sb.Append(" (asked for \"").Append(sid).Append("\")");
+				sb.Append("; storables: ").Append(string.Join(", ", a.GetStorableIDs().ToArray()));
+				throw new ApiError(sb.ToString());
+			}
+			return st;
+		}
+
+		/// <summary>Find a float param by case-insensitive substring (exact match first). Returns null when nothing matches.</summary>
+		private static string MatchFloatParam(JSONStorable st, string needle) {
+			if (needle == "") return null;
+			IList<string> names = st.GetFloatParamNames();
+			foreach (string n in names) if (string.Equals(n, needle, StringComparison.OrdinalIgnoreCase)) return n;
+			foreach (string n in names) if (n.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0) return n;
+			return null;
+		}
+
+		private static string MatchBoolParam(JSONStorable st, string needle) {
+			if (needle == "") return null;
+			IList<string> names = st.GetBoolParamNames();
+			foreach (string n in names) if (string.Equals(n, needle, StringComparison.OrdinalIgnoreCase)) return n;
+			foreach (string n in names) if (n.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0) return n;
+			return null;
+		}
+
+		private static string MatchChooserParam(JSONStorable st, string needle) {
+			if (needle == "") return null;
+			IList<string> names = st.GetStringChooserParamNames();
+			foreach (string n in names) if (string.Equals(n, needle, StringComparison.OrdinalIgnoreCase)) return n;
+			foreach (string n in names) if (n.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0) return n;
+			return null;
+		}
+
+		private static string MatchStringParam(JSONStorable st, string needle) {
+			if (needle == "") return null;
+			IList<string> names = st.GetStringParamNames();
+			foreach (string n in names) if (string.Equals(n, needle, StringComparison.OrdinalIgnoreCase)) return n;
+			foreach (string n in names) if (n.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0) return n;
+			return null;
+		}
+
+		private static string MatchUrlParam(JSONStorable st, string needle) {
+			if (needle == "") return null;
+			IList<string> names = st.GetUrlParamNames();
+			foreach (string n in names) if (string.Equals(n, needle, StringComparison.OrdinalIgnoreCase)) return n;
+			foreach (string n in names) if (n.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0) return n;
+			return null;
+		}
+
+		private static string MatchColorParam(JSONStorable st, string needle) {
+			if (needle == "") return null;
+			IList<string> names = st.GetColorParamNames();
+			foreach (string n in names) if (string.Equals(n, needle, StringComparison.OrdinalIgnoreCase)) return n;
+			foreach (string n in names) if (n.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0) return n;
+			return null;
+		}
+
+		/// <summary>Compact param snapshot of one storable, bounded per kind so listings stay readable.
+		/// Deep inspection should use list_storable_params.</summary>
+		private static JSONClass ParamSnapshot(JSONStorable st, int floats, int bools, int choosers, int strings, int urls) {
+			JSONClass r = new JSONClass();
+			int i = 0;
+			foreach (string n in st.GetFloatParamNames()) {
+				if (floats >= 0 && i++ >= floats) break;
+				r[n] = F(st.GetFloatParamValue(n));
+			}
+			i = 0;
+			foreach (string n in st.GetBoolParamNames()) {
+				if (bools >= 0 && i++ >= bools) break;
+				r[n] = JSONRaw.Bool(st.GetBoolParamValue(n));
+			}
+			i = 0;
+			foreach (string n in st.GetStringChooserParamNames()) {
+				if (choosers >= 0 && i++ >= choosers) break;
+				r[n] = st.GetStringChooserParamValue(n);
+			}
+			i = 0;
+			foreach (string n in st.GetStringParamNames()) {
+				if (strings >= 0 && i++ >= strings) break;
+				string v = st.GetStringParamValue(n);
+				if (v != null && v.Length > 160) v = v.Substring(0, 160) + "...";
+				r[n] = v;
+			}
+			i = 0;
+			foreach (string n in st.GetUrlParamNames()) {
+				if (urls >= 0 && i++ >= urls) break;
+				r[n] = st.GetUrlParamValue(n);
+			}
+			return r;
+		}
+
+		// ===================== scene animation / timeline =====================
+
+		private static bool AtomTypeMatches(Atom a, string wanted) {
+			if (a == null || wanted == "") return false;
+			return a.type.IndexOf(wanted, StringComparison.OrdinalIgnoreCase) >= 0;
+		}
+
+		public JSONNode ListAnimationPatterns(JSONNode args) {
+			string search = S(args, "search").ToLowerInvariant();
+			JSONArray arr = new JSONArray();
+			foreach (Atom a in SC.GetAtoms()) {
+				if (a == null) continue;
+				if (!AtomTypeMatches(a, "AnimationPattern") && !AtomTypeMatches(a, "AnimationStep")) continue;
+				if (search != "" && a.uid.ToLowerInvariant().IndexOf(search) < 0) continue;
+				JSONClass row = AtomInfo(a);
+				string used;
+				JSONStorable st = ResolveStorable(a, "AnimationPattern", "animation", out used);
+				if (st == null) st = ResolveStorable(a, "AnimationStep", "animation step", out used);
+				if (st == null) st = ResolveStorable(a, "", "anim", out used);
+				if (st != null) {
+					row["storable"] = used;
+					row["params"] = ParamSnapshot(st, 30, 15, 10, 4, 4);
+					row["actions"] = ActionHelp(st);
+				}
+				arr.Add(row);
+			}
+			JSONClass r = new JSONClass();
+			r["count"] = JSONRaw.Num(arr.Count);
+			r["patterns"] = arr;
+			return r;
+		}
+
+		private static Atom FindAtomQuiet(string uid) { return SC.GetAtomByUid(uid); }
+
+		public JSONNode ListAnimationSteps(JSONNode args) {
+			string patternUid = S(args, "pattern_uid");
+			JSONArray arr = new JSONArray();
+			int unresolved = 0;
+			foreach (Atom a in SC.GetAtoms()) {
+				if (a == null || !AtomTypeMatches(a, "AnimationStep")) continue;
+				string used;
+				JSONStorable st = ResolveStorable(a, "AnimationStep", "step", out used);
+				JSONClass row = AtomInfo(a);
+				if (st != null) {
+					row["storable"] = used;
+					row["params"] = ParamSnapshot(st, 20, 10, 10, 6, 0);
+					string linked = "";
+					try { if (MatchStringParam(st, "pattern") != null) linked = st.GetStringParamValue(MatchStringParam(st, "pattern")); } catch { }
+					if (linked == "") try { if (MatchChooserParam(st, "pattern") != null) linked = st.GetStringChooserParamValue(MatchStringParam(st, "pattern")); } catch { }
+					if (linked != "") {
+						row["pattern"] = linked;
+						if (patternUid == "" || string.Equals(linked, patternUid, StringComparison.OrdinalIgnoreCase)) arr.Add(row);
+						continue;
+					}
+				}
+				// linkage unknown: report the step (flagged) so the agent can match params by name
+				row["pattern"] = "(unresolved)";
+				unresolved++;
+				if (patternUid == "") arr.Add(row);
+			}
+			JSONClass r = new JSONClass();
+			r["count"] = JSONRaw.Num(arr.Count);
+			r["unresolvedLinkage"] = JSONRaw.Num(unresolved);
+			r["steps"] = arr;
+			if (unresolved > 0 && patternUid != "") {
+				r["note"] = "some AnimationStep atoms report no pattern linkage param; use list_atoms/list_animation_patterns and match controller/min/max params manually, or attach steps via the AnimationPattern UI tab";
+			}
+			return r;
+		}
+
+		/// <summary>Poller tool. Create an AnimationPattern atom (timeline container).</summary>
+		public JSONNode CreateAnimationPattern(JSONNode args) {
+			JSONClass sub = new JSONClass();
+			sub["type"] = "AnimationPattern";
+			if (Has(args, "uid")) sub["uid"] = args["uid"];
+			return AddAtom(sub);
+		}
+
+		/// <summary>Poller tool. Create an AnimationStep atom and best-effort configure it against its pattern.</summary>
+		public JSONNode CreateAnimationStep(JSONNode args) {
+			JSONClass sub = new JSONClass();
+			sub["type"] = "AnimationStep";
+			if (Has(args, "uid")) sub["uid"] = args["uid"];
+			JSONNode created = AddAtom(sub);
+			Atom a = FindAtom(created["uid"]);
+			string used;
+			JSONStorable st = ResolveStorable(a, "AnimationStep", "step", out used);
+			JSONClass applied = new JSONClass();
+			if (st != null) {
+				string transition = S(args, "transition_type");
+				if (transition != "") {
+					string p = MatchChooserParam(st, "transition");
+					if (p == null) p = MatchFloatParam(st, "transition");
+					try {
+						if (p != null && MatchFloatParam(st, p) == null) {
+							st.SetStringChooserParamValue(p, transition);
+							applied[p] = transition;
+						} else if (p != null) {
+							st.SetFloatParamValue(p, NumArg(transition));
+							applied[p] = F(NumArg(transition));
+						} else applied["transitionType"] = "not found (check param names via list_storable_params)";
+					} catch (Exception e) {
+						applied["transitionType.error"] = e.Message;
+					}
+				}
+				if (Has(args, "duration")) {
+					string p = MatchFloatParam(st, "duration");
+					if (p == null) p = MatchFloatParam(st, "length");
+					if (p != null) {
+						st.SetFloatParamValue(p, Num(args, "duration", 1f));
+						applied[p] = F(st.GetFloatParamValue(p));
+					} else applied["duration"] = "not found";
+				}
+				// try to auto-add/open the step inside the pattern: many setups expose an Add/Assign action
+				string patternUid = S(args, "pattern_uid");
+				JSONStorableAction link = null;
+				if (st != null) {
+					foreach (string n in st.GetActionNames()) {
+						if (n.IndexOf("add", StringComparison.OrdinalIgnoreCase) >= 0 && n.IndexOf("pattern", StringComparison.OrdinalIgnoreCase) >= 0) { link = st.GetAction(n); break; }
+					}
+				}
+				if (link == null && patternUid != "") {
+					Atom pat = FindAtomQuiet(patternUid);
+					if (pat != null) {
+						string pu;
+						JSONStorable pst = ResolveStorable(pat, "AnimationPattern", "animation", out pu);
+						if (pst != null) {
+							foreach (string n in pst.GetActionNames()) {
+								string ln = n.ToLowerInvariant();
+								if ((ln.IndexOf("add") >= 0 || ln.IndexOf("attach") >= 0 || ln.IndexOf("register") >= 0) && (ln.IndexOf("step") >= 0 || ln.IndexOf("animation") >= 0)) { link = pst.GetAction(n); break; }
+							}
+						}
+					}
+				}
+				if (link == null) {
+					if (st.GetActionNames().Contains("Link To Animation Pattern")) link = st.GetAction("Link To Animation Pattern");
+				}
+				if (link != null && link.actionCallback != null) {
+					try { link.actionCallback(); applied["linked"] = link.name; } catch (Exception e) { applied["linked.error"] = e.Message; }
+				}
+			}
+			created["applied"] = applied;
+			created["note"] = "attaching the step to its pattern happens in the VaM UI when no auto-link action exists; verify with list_animation_steps";
+			return created;
+		}
+
+		private static float NumArg(string raw) {
+			if (raw == null) return 0f;
+			return (float)System.Convert.ChangeType(raw, typeof(float), CultureInfo.InvariantCulture);
+		}
+
+		public JSONNode AnimationPatternAction(JSONNode args) {
+			Atom a = FindAtom(S(args, "pattern_uid"));
+			string used;
+			JSONStorable st = ResolveStorable(a, "AnimationPattern", "animation", out used);
+			if (st == null) throw new ApiError("no AnimationPattern storable on " + a.uid + "; storables: " + string.Join(", ", a.GetStorableIDs().ToArray()));
+			string action = S(args, "action");
+			if (action == "") throw new ApiError("action required (Play, Pause, Stop, SetTime/ScrubToTime or any action name shown in list)");
+			JSONClass r = new JSONClass();
+			r["uid"] = a.uid;
+			r["storable"] = used;
+			string la = action.ToLowerInvariant();
+			if (la == "settime" || la == "scrubtotime" || la == "scrub") {
+				float t = Num(args, "time", 0f);
+				string p = MatchFloatParam(st, "time");
+				if (p != null) {
+					st.SetFloatParamValue(p, t);
+					r["time"] = F(t);
+					return r;
+				}
+				throw new ApiError("no 'time' param on this pattern; " + ActionHelp(st));
+			}
+			JSONStorableAction act = FindActionCI(st, action);
+			if (act == null && la == "play") act = FindActionCI(st, "Play");
+			if (act == null && la == "stop") act = FindActionCI(st, "Stop");
+			if (act == null) throw new ApiError("action not found: " + action + "; " + ActionHelp(st));
+			if (act.actionCallback != null) act.actionCallback();
+			r["called"] = act.name;
+			return r;
+		}
+
+		public JSONNode AnimationStepAction(JSONNode args) {
+			Atom a = FindAtom(S(args, "step_uid"));
+			string used;
+			JSONStorable st = ResolveStorable(a, "AnimationStep", "step", out used);
+			if (st == null) throw new ApiError("no AnimationStep storable on " + a.uid + "; storables: " + string.Join(", ", a.GetStorableIDs().ToArray()));
+			string action = S(args, "action");
+			if (action == "") throw new ApiError("action required (Play, Stop, SetTransition, SetDuration or any action name)");
+			JSONClass r = new JSONClass();
+			r["uid"] = a.uid;
+			r["storable"] = used;
+			string la = action.ToLowerInvariant();
+			if (la == "settransition") {
+				string want = S(args, "value");
+				string p = MatchChooserParam(st, "transition");
+				if (p == null) throw new ApiError("no transition param; " + ActionHelp(st));
+				st.SetStringChooserParamValue(p, want);
+				r["transition"] = st.GetStringChooserParamValue(p);
+				return r;
+			}
+			if (la == "setduration") {
+				string p = MatchFloatParam(st, "duration");
+				if (p == null) throw new ApiError("no duration param; " + ActionHelp(st));
+				st.SetFloatParamValue(p, Num(args, "value", 1f));
+				r["duration"] = F(st.GetFloatParamValue(p));
+				return r;
+			}
+			JSONStorableAction act = FindActionCI(st, action);
+			if (act == null) throw new ApiError("action not found: " + action + "; " + ActionHelp(st));
+			if (act.actionCallback != null) act.actionCallback();
+			r["called"] = act.name;
+			return r;
+		}
+
+		public JSONNode RecordSceneAnimation(JSONNode args) {
+			Atom a = FindAtom(S(args, "pattern_uid"));
+			JSONStorable st = RequireResolvedStorable(a, "AnimationPattern", "animation", "AnimationPattern");
+			string action = S(args, "action").ToLowerInvariant();
+			if (action != "start" && action != "stop") throw new ApiError("action required: start or stop");
+			foreach (string n in st.GetActionNames()) {
+				string ln = n.ToLowerInvariant();
+				bool matchesStart = action == "start" && (ln.IndexOf("record") >= 0 && ln.IndexOf("stop") < 0);
+				bool matchesStop = action == "stop" && ln.IndexOf("stop") >= 0 && (ln.IndexOf("record") >= 0 || ln.IndexOf("end") >= 0);
+				if (matchesStart || matchesStop) {
+					JSONStorableAction act = st.GetAction(n);
+					if (act != null && act.actionCallback != null) {
+						act.actionCallback();
+						JSONClass r = new JSONClass();
+						r["uid"] = a.uid;
+						r["called"] = n;
+						r["recordPhysics"] = JSONRaw.Bool(Bool(args, "record_physics", false));
+						return r;
+					}
+				}
+			}
+			throw new ApiError("this AnimationPattern exposes no Record action; VaM's built-in controller recording is UI-only (" + ActionHelp(st) + "). Alternative: drive FreeControllerV3 controls with set_control from your agent script, or capture poses with save_pose per frame");
+		}
+
+		// ===================== triggers =====================
+
+		public JSONNode ListTriggers(JSONNode args) {
+			string search = S(args, "search").ToLowerInvariant();
+			JSONArray arr = new JSONArray();
+			foreach (Atom a in SC.GetAtoms()) {
+				if (a == null) continue;
+				foreach (string sid in a.GetStorableIDs()) {
+					if (sid.IndexOf("trigger", StringComparison.OrdinalIgnoreCase) < 0) continue;
+					JSONStorable st = a.GetStorableByID(sid);
+					if (st == null) continue;
+					if (search != "" && a.uid.ToLowerInvariant().IndexOf(search) < 0 && sid.ToLowerInvariant().IndexOf(search) < 0) continue;
+					JSONClass row = new JSONClass();
+					row["uid"] = a.uid;
+					row["type"] = a.type;
+					row["storable"] = sid;
+					row["params"] = ParamSnapshot(st, 10, 8, 4, 6, 2);
+					row["actions"] = ActionHelp(st);
+					arr.Add(row);
+					break; // one trigger row per atom keeps listings small
+				}
+				if (arr.Count >= 80) break;
+			}
+			JSONClass r = new JSONClass();
+			r["count"] = JSONRaw.Num(arr.Count);
+			r["triggers"] = arr;
+			return r;
+		}
+
+		public JSONNode TriggerAction(JSONNode args) {
+			string tuid = S(args, "trigger_uid");
+			if (tuid == "") throw new ApiError("trigger_uid required (see list_triggers)");
+			Atom a;
+			string sid = S(args, "storable");
+			// accept "atom uid" or "atom/Trigger" combined
+			int slice = tuid.IndexOf('/');
+			if (slice >= 0 && ParamEmpty(sid)) {
+				sid = tuid.Substring(slice + 1);
+				tuid = tuid.Substring(0, slice);
+			}
+			a = FindAtom(tuid);
+			string la = S(args, "action").ToLowerInvariant();
+			if (la == "fire") la = "trigger";
+			if (la == "" ) throw new ApiError("action required: Fire, SetFloatParam, SetBoolParam, Reset or any action name");
+			string used;
+			JSONStorable st = ResolveStorable(a, sid, sid == "" ? "trigger" : null, out used);
+			if (st == null) throw new ApiError("no trigger storable on " + a.uid + "; storables: " + string.Join(", ", a.GetStorableIDs().ToArray()));
+			JSONClass r = new JSONClass();
+			r["uid"] = a.uid;
+			r["storable"] = used;
+			if (la == "setfloatparam") {
+				string p = S(args, "param");
+				st.SetFloatParamValue(p, Num(args, "value", 0f));
+				r["param"] = p;
+				r["value"] = F(st.GetFloatParamValue(p));
+				return r;
+			}
+			if (la == "setboolparam") {
+				string p = S(args, "param");
+				st.SetBoolParamValue(p, Bool(args, "value", true));
+				r["param"] = p;
+				r["value"] = JSONRaw.Bool(st.GetBoolParamValue(p));
+				return r;
+			}
+			JSONStorableAction act = FindActionCI(st, la);
+			if (act == null) throw new ApiError("action not found: " + S(args, "action") + "; " + ActionHelp(st));
+			if (act.actionCallback != null) act.actionCallback();
+			r["called"] = act.name;
+			return r;
+		}
+
+		private static bool ParamEmpty(string s) { return string.IsNullOrEmpty(s); }
+
+		/// <summary>Poller tool. Create a UI trigger atom (buttons/toggles etc.) and point at its Trigger storable.</summary>
+		public JSONNode CreateTrigger(JSONNode args) {
+			string type = S(args, "type");
+			if (type == "") type = "UIButton";
+			JSONClass sub = new JSONClass();
+			sub["type"] = type;
+			if (Has(args, "uid")) sub["uid"] = args["uid"];
+			JSONNode created = AddAtom(sub);
+			try {
+				Atom a = FindAtom(created["uid"]);
+				string used;
+				JSONStorable st = ResolveStorable(a, "Trigger", "trigger", out used);
+				if (st != null) {
+					created["storable"] = used;
+					created["params"] = ParamSnapshot(st, 10, 8, 4, 6, 4);
+					created["actions"] = ActionHelp(st);
+				}
+			} catch (Exception e) { created["note"] = e.Message; }
+			return created;
+		}
+
+		public JSONNode TriggerUI(JSONNode args) {
+			Atom a = FindAtom(S(args, "trigger_uid"));
+			string la = S(args, "action").ToLowerInvariant();
+			if (la == "" ) throw new ApiError("action required: Show, Hide or Refresh");
+			string used;
+			JSONStorable st = ResolveStorable(a, "Trigger", "trigger", out used);
+			if (st == null) throw new ApiError("no trigger storable on " + a.uid);
+			foreach (string n in st.GetActionNames()) {
+				string ln = n.ToLowerInvariant();
+				bool isShow = (la == "show" && (ln.IndexOf("open") >= 0 || ln.IndexOf("show") >= 0));
+				bool isHide = (la == "hide" && (ln.IndexOf("close") >= 0 || ln.IndexOf("hide") >= 0 || ln.IndexOf("dismiss") >= 0));
+				bool isRefresh = (la == "refresh" && (ln.IndexOf("trigger") >= 0 || ln.IndexOf("fire") >= 0 || ln.IndexOf("apply") >= 0));
+				if (isShow || isHide || isRefresh) {
+					JSONStorableAction act = st.GetAction(n);
+					if (act != null && act.actionCallback != null) {
+						act.actionCallback();
+						JSONClass r = new JSONClass();
+						r["uid"] = a.uid;
+						r["called"] = n;
+						return r;
+					}
+				}
+			}
+			throw new ApiError("no matching action for " + S(args, "action") + "; " + ActionHelp(st) + "; VaM opens trigger UIs by double-clicking the atom in the scene panel — automate that with press_key/tab keys if needed");
+		}
+
+		// ===================== physics =====================
+
+		private static readonly string[] PhysicsKeywords = { "physics", "collision", "force", "spring", "joint", "dynamics", "gravity" };
+
+		public JSONNode ListPhysicsObjects(JSONNode args) {
+			string search = S(args, "search").ToLowerInvariant();
+			JSONArray arr = new JSONArray();
+			foreach (Atom a in SC.GetAtoms()) {
+				if (a == null) continue;
+				if (search != "" && a.uid.ToLowerInvariant().IndexOf(search) < 0) continue;
+				JSONArray phys = new JSONArray();
+				foreach (string sid in a.GetStorableIDs()) {
+					bool hits = false;
+					foreach (string k in PhysicsKeywords) {
+						if (sid.ToLowerInvariant().IndexOf(k) >= 0) { hits = true; break; }
+					}
+					if (hits) phys.Add(sid);
+				}
+				if (phys.Count > 0) {
+					JSONClass row = AtomInfo(a);
+					row["physicsStorables"] = phys;
+					arr.Add(row);
+					if (arr.Count >= 120) break;
+				}
+			}
+			JSONClass r = new JSONClass();
+			r["count"] = JSONRaw.Num(arr.Count);
+			r["objects"] = arr;
+			return r;
+		}
+
+		public JSONNode PhysicsObjectAction(JSONNode args) {
+			Atom a = FindAtom(S(args, "uid"));
+			string la = S(args, "action").ToLowerInvariant();
+			if (la == "" ) throw new ApiError("action required: EnablePhysics, DisablePhysics, SetCollision, AddForce, SetMass, SetDrag");
+			JSONClass r = new JSONClass();
+			r["uid"] = a.uid;
+			bool wantEnable = la == "enablephysics";
+			bool wantDisable = la == "disablephysics";
+			if (wantEnable || wantDisable) {
+				int touched = 0;
+				foreach (string sid in a.GetStorableIDs()) {
+					JSONStorable st = a.GetStorableByID(sid);
+					if (st == null) continue;
+					string p = MatchBoolParam(st, "enabled");
+					if (p == null) p = MatchBoolParam(st, "simulate");
+					if (p == null) p = MatchBoolParam(st, "on/isactive");
+					if (p == null && (sid.IndexOf("physics", StringComparison.OrdinalIgnoreCase) >= 0 || sid.IndexOf("collision", StringComparison.OrdinalIgnoreCase) >= 0)) p = MatchBoolParam(st, "on");
+					if (p == null) continue;
+					st.SetBoolParamValue(p, wantEnable);
+					touched++;
+					r[sid + "." + p] = JSONRaw.Bool(st.GetBoolParamValue(p));
+				}
+				r["touched"] = JSONRaw.Num(touched);
+				return r;
+			}
+			if (la == "setcollision") {
+				int touched = 0;
+				foreach (string sid in a.GetStorableIDs()) {
+					JSONStorable st = a.GetStorableByID(sid);
+					if (st == null) continue;
+					string p = MatchBoolParam(st, "collision");
+					if (p == null) p = MatchBoolParam(st, "collide");
+					if (p == null) continue;
+					st.SetBoolParamValue(p, Bool(args, "value", true));
+					touched++;
+					r[sid + "." + p] = JSONRaw.Bool(st.GetBoolParamValue(p));
+				}
+				r["touched"] = JSONRaw.Num(touched);
+				return r;
+			}
+			// single-storable operations for the first physicsy storable we find
+			JSONStorable target = null;
+			string usedSid = "";
+			foreach (string sid in a.GetStorableIDs()) {
+				foreach (string k in new string[] { "force", "physics", "collision", "dynamics" }) {
+					if (sid.IndexOf(k, StringComparison.OrdinalIgnoreCase) >= 0) {
+						JSONStorable st = a.GetStorableByID(sid);
+						if (st != null) { target = st; usedSid = sid; break; }
+					}
+				}
+				if (target != null) break;
+			}
+			if (target == null) throw new ApiError("no physics storable on " + a.uid + "; storables: " + string.Join(", ", a.GetStorableIDs().ToArray()));
+			r["storable"] = usedSid;
+			if (la == "addforce") {
+				string p = MatchFloatParam(target, "force");
+				if (p == null) throw new ApiError("no force param on " + usedSid + "; " + ActionHelp(target));
+				float magnitude = Num(args, "magnitude", Num(args, "value", target.GetFloatParamValue(p)));
+				target.SetFloatParamValue(p, magnitude);
+				r["force"] = F(target.GetFloatParamValue(p));
+				string dx = MatchFloatParam(target, "x");
+				string dy = MatchFloatParam(target, "y");
+				string dz = MatchFloatParam(target, "z");
+				if (Has(args, "direction")) {
+					Vector3 d = ParseVec3(args["direction"]);
+					if (dx != null) target.SetFloatParamValue(dx, d.x);
+					if (dy != null) target.SetFloatParamValue(dy, d.y);
+					if (dz != null) target.SetFloatParamValue(dz, d.z);
+				}
+				return r;
+			}
+			if (la == "setmass" || la == "setdrag") {
+				string p = MatchFloatParam(target, la == "setmass" ? "mass" : "drag");
+				if (p == null) throw new ApiError("no such param on " + usedSid + "; " + ActionHelp(target));
+				target.SetFloatParamValue(p, Num(args, "value", 1f));
+				r["param"] = p;
+				r["value"] = F(target.GetFloatParamValue(p));
+				return r;
+			}
+			throw new ApiError("unknown physics action: " + S(args, "action") + "; " + ActionHelp(target));
+		}
+
+		/// <summary>Poller tool. Create a ConfigurableJoint/SpringJoint/FixedJoint between two atoms using Unity's legacy joints.</summary>
+		public JSONNode CreatePhysicsJoint(JSONNode args) {
+			string uidA = S(args, "atom_a");
+			string uidB = S(args, "atom_b");
+			string jointType = S(args, "joint_type").ToLowerInvariant();
+			if (jointType == "") jointType = "configurablejoint";
+			bool spring = jointType.IndexOf("spring") >= 0;
+			bool fixedJ = jointType.IndexOf("fixed") >= 0;
+			GameObject ga = null, gb = null;
+			Rigidbody rbA = null, rbB = null;
+			Atom aa = FindAtom(uidA), ab = FindAtom(uidB);
+			Mt.Run(delegate {
+				ga = aa.mainController != null ? aa.mainController.gameObject : aa.gameObject;
+				gb = ab.mainController != null ? ab.mainController.gameObject : ab.gameObject;
+				rbA = ga.GetComponent<Rigidbody>();
+				if (rbA == null) rbA = ga.AddComponent<Rigidbody>();
+				rbB = gb.GetComponent<Rigidbody>();
+				if (rbB == null) rbB = gb.AddComponent<Rigidbody>();
+			}, 10000);
+			if (rbA == null || rbB == null) throw new ApiError("could not obtain Rigidbody hosts for " + uidA + " / " + uidB);
+			Joint joint = Mt.Run(delegate {
+				if (spring) {
+					SpringJoint sj = ga.AddComponent<SpringJoint>();
+					sj.connectedBody = rbB;
+					return sj as Joint;
+				}
+				if (fixedJ) {
+					FixedJoint fj = ga.AddComponent<FixedJoint>();
+					fj.connectedBody = rbB;
+					return fj as Joint;
+				}
+				ConfigurableJoint cj = ga.AddComponent<ConfigurableJoint>();
+				cj.connectedBody = rbB;
+				return cj as Joint;
+			}, 10000);
+			if (joint == null) throw new ApiError("joint creation failed");
+			Mt.Run(delegate {
+				Vector3 local = ga.transform.InverseTransformPoint(gb.transform.position);
+				joint.anchor = local;
+				ConfigurableJoint cj = joint as ConfigurableJoint;
+				if (cj != null && Has(args, "anchor")) cj.anchor = ParseVec3(args["anchor"]);
+				ConfigurableJoint cj2 = joint as ConfigurableJoint;
+				SpringJoint sj = joint as SpringJoint;
+				if (Has(args, "connected_anchor")) {
+					if (cj2 != null) cj2.connectedAnchor = ParseVec3(args["connected_anchor"]);
+					else if (sj != null) sj.connectedAnchor = ParseVec3(args["connected_anchor"]);
+				}
+			}, 10000);
+			JSONClass r = new JSONClass();
+			r["joint"] = joint.GetType().Name;
+			r["atom_a"] = uidA;
+			r["atom_b"] = uidB;
+			r["note"] = "legacy Unity joint on top of VaM's own physics; VaM soft-body physics may fight it — verify visuals and consider a dedicated plugin (BoneControl/BodyAttach) instead";
+			return r;
+		}
+
+		// ===================== scene lighting / audio / misc =====================
+
+		public JSONNode ListLights(JSONNode args) {
+			JSONArray arr = new JSONArray();
+			foreach (Atom a in SC.GetAtoms()) {
+				if (a == null) continue;
+				if (a.type.IndexOf("light", StringComparison.OrdinalIgnoreCase) < 0) continue;
+				JSONClass row = AtomInfo(a);
+				string used;
+				JSONStorable st = ResolveStorable(a, "light", "light", out used);
+				if (st != null) {
+					row["storable"] = used;
+					row["params"] = ParamSnapshot(st, 20, 10, 6, 4, 2);
+				}
+				arr.Add(row);
+				if (arr.Count >= 60) break;
+			}
+			JSONClass r = new JSONClass();
+			r["count"] = JSONRaw.Num(arr.Count);
+			r["lights"] = arr;
+			return r;
+		}
+
+		public JSONNode LightAction(JSONNode args) {
+			Atom a = FindAtom(S(args, "uid"));
+			JSONStorable st = RequireResolvedStorable(a, "light", "light", "Light");
+			string la = S(args, "action").ToLowerInvariant();
+			if (la == "" ) throw new ApiError("action required: Toggle, SetColor, SetIntensity, SetRange, SetSpotAngle, SetType");
+			JSONClass r = new JSONClass();
+			r["uid"] = a.uid;
+			r["storable"] = a.GetStorableIDs().Contains("light") ? "light" : "(resolved)";
+			if (la == "toggle") {
+				string p = MatchBoolParam(st, "enabled");
+				if (p == null) p = MatchBoolParam(st, "on");
+				if (p == null) throw new ApiError("no enabled param; " + ActionHelp(st));
+				st.SetBoolParamValue(p, !st.GetBoolParamValue(p));
+				r["enabled"] = JSONRaw.Bool(st.GetBoolParamValue(p));
+				return r;
+			}
+			if (la == "setcolor") {
+				string p = MatchColorParam(st, "color");
+				if (p == null) throw new ApiError("no color param; " + ActionHelp(st));
+				st.SetColorParamValue(p, ParseColor(S(args, "value")));
+				r["color"] = ColorToHex(st.GetColorParamValue(p));
+				return r;
+			}
+			if (la == "setintensity" || la == "setrange" || la == "setspotangle") {
+				string p = MatchFloatParam(st, la == "setintensity" ? "intensity" : la == "setrange" ? "range" : "spot");
+				if (p == null) throw new ApiError("no float param for " + S(args, "action") + "; " + ActionHelp(st));
+				st.SetFloatParamValue(p, Num(args, "value", 1f));
+				r["param"] = p;
+				r["value"] = F(st.GetFloatParamValue(p));
+				return r;
+			}
+			if (la == "settype") {
+				string p = MatchChooserParam(st, "type");
+				if (p == null) throw new ApiError("no type chooser; " + ActionHelp(st));
+				st.SetStringChooserParamValue(p, S(args, "value"));
+				r["type"] = st.GetStringChooserParamValue(p);
+				return r;
+			}
+			throw new ApiError("unknown light action: " + S(args, "action") + "; " + ActionHelp(st));
+		}
+
+		public JSONNode ListAudioSources(JSONNode args) {
+			JSONArray arr = new JSONArray();
+			foreach (Atom a in SC.GetAtoms()) {
+				if (a == null) continue;
+				if (a.type.IndexOf("audio", StringComparison.OrdinalIgnoreCase) < 0) continue;
+				JSONClass row = AtomInfo(a);
+				string used;
+				JSONStorable st = ResolveStorable(a, "AudioSource", "audio", out used);
+				if (st != null) {
+					row["storable"] = used;
+					row["params"] = ParamSnapshot(st, 14, 8, 4, 8, 4);
+					row["actions"] = ActionHelp(st);
+				}
+				arr.Add(row);
+				if (arr.Count >= 60) break;
+			}
+			JSONClass r = new JSONClass();
+			r["count"] = JSONRaw.Num(arr.Count);
+			r["audio"] = arr;
+			return r;
+		}
+
+		public JSONNode AudioSourceAction(JSONNode args) {
+			Atom a = FindAtom(S(args, "uid"));
+			JSONStorable st = RequireResolvedStorable(a, "AudioSource", "audio", "AudioSource");
+			string la = S(args, "action").ToLowerInvariant();
+			if (la == "" ) throw new ApiError("action required: Play, Stop, Pause, SetVolume, SetClip, SetLoop");
+			JSONClass r = new JSONClass();
+			r["uid"] = a.uid;
+			if (la == "play" || la == "stop" || la == "pause") {
+				JSONStorableAction act = FindActionCI(st, la);
+				if (act != null && act.actionCallback != null) { act.actionCallback(); r["called"] = act.name; return r; }
+				// fallback: drive play/loop bools
+				string p = la == "play" ? MatchBoolParam(st, "play") : null;
+				if (p != null) { st.SetBoolParamValue(p, la == "play"); r[p] = JSONRaw.Bool(st.GetBoolParamValue(p)); return r; }
+				throw new ApiError("no " + la + " action; " + ActionHelp(st));
+			}
+			if (la == "setvolume") {
+				string p = MatchFloatParam(st, "volume");
+				if (p == null) throw new ApiError("no volume param; " + ActionHelp(st));
+				st.SetFloatParamValue(p, Num(args, "value", 1f));
+				r["volume"] = F(st.GetFloatParamValue(p));
+				return r;
+			}
+			if (la == "setclip") {
+				string p = MatchUrlParam(st, "url");
+				if (p == null) p = MatchUrlParam(st, "source");
+				if (p == null) throw new ApiError("no audio url param; " + ActionHelp(st));
+				st.SetUrlParamValue(p, S(args, "value"));
+				r["url"] = st.GetUrlParamValue(p);
+				return r;
+			}
+			if (la == "setloop") {
+				string p = MatchBoolParam(st, "loop");
+				if (p == null) throw new ApiError("no loop param; " + ActionHelp(st));
+				st.SetBoolParamValue(p, Bool(args, "value", true));
+				r["loop"] = JSONRaw.Bool(st.GetBoolParamValue(p));
+				return r;
+			}
+			throw new ApiError("unknown audio action: " + S(args, "action") + "; " + ActionHelp(st));
+		}
+
+		// ===================== user preferences =====================
+
+		/// <summary>Read the '.val' member of a JSONStorable param object (it is a public field on most kinds).</summary>
+		private static object ReadPrefVal(object p) {
+			Type t = p.GetType();
+			FieldInfo f = t.GetField("val", BindingFlags.Public | BindingFlags.Instance);
+			if (f != null) return f.GetValue(p);
+			PropertyInfo pr = t.GetProperty("val", BindingFlags.Public | BindingFlags.Instance);
+			return pr != null ? pr.GetValue(p, null) : null;
+		}
+
+		private static void WritePrefVal(object p, object value) {
+			Type t = p.GetType();
+			FieldInfo f = t.GetField("val", BindingFlags.Public | BindingFlags.Instance);
+			if (f != null) { f.SetValue(p, value); return; }
+			PropertyInfo pr = t.GetProperty("val", BindingFlags.Public | BindingFlags.Instance);
+			if (pr != null) { pr.SetValue(p, value, new object[0]); return; }
+			throw new ApiError("param object has no writable 'val' member");
+		}
+
+		private static List<object> UserPrefParams() {
+			List<object> found = new List<object>();
+			Type t = typeof(UserPreferences);
+			if (t == null) return found;
+			FieldInfo[] fs = t.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+			foreach (FieldInfo f in fs) {
+				string tn = f.FieldType.Name;
+				if (tn == "JSONStorableFloat" || tn == "JSONStorableBool" || tn == "JSONStorableString" ||
+					tn == "JSONStorableStringChooser" || tn == "JSONStorableUrl" || tn == "JSONStorableColor") {
+					object v = f.GetValue(UserPreferences.singleton);
+					if (v != null) found.Add(v);
+				}
+			}
+			return found;
+		}
+
+		/// <summary>The JSONStorable that owns the user preference params: CoreControl's UserPreferences
+		/// storable (whose param names start with 'pref'); falls back to SuperController's storable form.</summary>
+		/// <summary>Public, renderable properties of UserPreferences (bool/float/int/string/enum only).</summary>
+		private static List<PropertyInfo> PrefProps() {
+			List<PropertyInfo> found = new List<PropertyInfo>();
+			PropertyInfo[] props = typeof(UserPreferences).GetProperties(BindingFlags.Public | BindingFlags.Instance);
+			foreach (PropertyInfo p in props) {
+				if (p == null || !p.CanRead) continue;
+				Type t = p.PropertyType;
+				if (t == typeof(bool) || t == typeof(float) || t == typeof(int) || t == typeof(string) || t.IsEnum) found.Add(p);
+			}
+			found.Sort((a, b) => string.Compare(a.Name, b.Name));
+			return found;
+		}
+
+		/// <summary>Public primitive fields of UserPreferences the properties do not cover (e.g. physicsRate).</summary>
+		private static List<FieldInfo> PrefFields(List<string> excludeNames) {
+			List<FieldInfo> found = new List<FieldInfo>();
+			FieldInfo[] fields = typeof(UserPreferences).GetFields(BindingFlags.Public | BindingFlags.Instance);
+			foreach (FieldInfo f in fields) {
+				if (f == null) continue;
+				Type t = f.FieldType;
+				if (!(t == typeof(bool) || t == typeof(float) || t == typeof(int) || t == typeof(string) || t.IsEnum)) continue;
+				if (excludeNames != null && excludeNames.Contains(f.Name)) continue;
+				found.Add(f);
+			}
+			found.Sort((a, b) => string.Compare(a.Name, b.Name));
+			return found;
+		}
+
+		private static string PrefToString(object val) {
+			if (val == null) return "";
+			return val.ToString();
+		}
+
+		public JSONNode GetUserPreferences(JSONNode args) {
+			string category = S(args, "category").ToLowerInvariant();
+			JSONClass r = new JSONClass();
+			JSONArray items = new JSONArray();
+			int total = 0;
+			UserPreferences up = UserPreferences.singleton;
+			if (up == null) throw new ApiError("UserPreferences.singleton not initialised yet");
+			List<string> propNames = new List<string>();
+			foreach (PropertyInfo p in PrefProps()) {
+				total++;
+				propNames.Add(p.Name);
+				string n = p.Name;
+				if (category != "" && n.ToLowerInvariant().IndexOf(category) < 0) continue;
+				JSONClass row = new JSONClass();
+				row["name"] = n;
+				row["kind"] = "property";
+				row["type"] = p.PropertyType.Name;
+				object val = null;
+				try { val = p.GetValue(up, null); } catch (Exception e) { row["value.error"] = e.Message; }
+				row["value"] = PrefToString(val);
+				items.Add(row);
+			}
+			foreach (FieldInfo f in PrefFields(propNames)) {
+				total++;
+				string n = f.Name;
+				if (category != "" && n.ToLowerInvariant().IndexOf(category) < 0) continue;
+				JSONClass row = new JSONClass();
+				row["name"] = n;
+				row["kind"] = "field";
+				row["type"] = f.FieldType.Name;
+				object val = null;
+				try { val = f.GetValue(up); } catch (Exception e) { row["value.error"] = e.Message; }
+				row["value"] = PrefToString(val);
+				items.Add(row);
+			}
+			r["count"] = JSONRaw.Num(items.Count);
+			r["total"] = JSONRaw.Num(total);
+			r["prefs"] = items;
+			if (category == "" && items.Count >= 400) r["note"] = "pass a category filter (e.g. 'physics', 'vr', 'render') to keep the list small";
+			return r;
+		}
+
+		public JSONNode SetUserPreferences(JSONNode args) {
+			string name = S(args, "key");
+			if (name == "") throw new ApiError("key required (see get_user_preferences)");
+			JSONNode value = args["value"];
+			if (value == null) throw new ApiError("value required");
+			UserPreferences up = UserPreferences.singleton;
+			if (up == null) throw new ApiError("UserPreferences.singleton not initialised yet");
+			JSONClass r = new JSONClass();
+			r["key"] = name;
+			Type ut = typeof(UserPreferences);
+			PropertyInfo prop = ut.GetProperty(name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
+			if (prop == null) {
+				foreach (PropertyInfo pp in ut.GetProperties(BindingFlags.Public | BindingFlags.Instance)) {
+					if (string.Equals(pp.Name, name, StringComparison.OrdinalIgnoreCase)) { prop = pp; break; }
+				}
+			}
+			if (prop != null && prop.CanWrite) {
+				try {
+					r["kind"] = "property";
+					r["type"] = prop.PropertyType.Name;
+					object converted;
+					if (prop.PropertyType == typeof(bool)) converted = value.AsBool;
+					else if (prop.PropertyType == typeof(float)) converted = value.AsFloat;
+					else if (prop.PropertyType == typeof(int)) converted = value.AsInt;
+					else if (prop.PropertyType == typeof(string)) converted = value.Value;
+					else if (prop.PropertyType.IsEnum) converted = Enum.Parse(prop.PropertyType, value.Value, true);
+					else converted = value.Value;
+					prop.SetValue(up, converted, new object[0]);
+					object rd = prop.GetValue(up, null);
+					r["value"] = PrefToString(rd);
+				} catch (Exception e) {
+					throw new ApiError("failed to set pref " + name + ": " + e.Message);
+				}
+				try { up.SavePreferences(); r["saved"] = JSONRaw.Bool(true); } catch (Exception se) { r["saved"] = JSONRaw.Bool(false); r["save.error"] = se.Message; }
+				return r;
+			}
+			FieldInfo field = ut.GetField(name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
+			if (field == null) {
+				foreach (FieldInfo ff in ut.GetFields(BindingFlags.Public | BindingFlags.Instance)) {
+					if (string.Equals(ff.Name, name, StringComparison.OrdinalIgnoreCase)) { field = ff; break; }
+				}
+			}
+			if (field != null) {
+				try {
+					r["kind"] = "field";
+					r["type"] = field.FieldType.Name;
+					object converted;
+					if (field.FieldType == typeof(bool)) converted = value.AsBool;
+					else if (field.FieldType == typeof(float)) converted = value.AsFloat;
+					else if (field.FieldType == typeof(int)) converted = value.AsInt;
+					else if (field.FieldType == typeof(string)) converted = value.Value;
+					else if (field.FieldType.IsEnum) converted = Enum.Parse(field.FieldType, value.Value, true);
+					else converted = value.Value;
+					field.SetValue(up, converted, BindingFlags.Public | BindingFlags.Instance, null, null);
+					object rd = field.GetValue(up);
+					r["value"] = PrefToString(rd);
+				} catch (Exception e) {
+					throw new ApiError("failed to set pref " + name + ": " + e.Message);
+				}
+				try { up.SavePreferences(); r["saved"] = JSONRaw.Bool(true); } catch (Exception se) { r["saved"] = JSONRaw.Bool(false); r["save.error"] = se.Message; }
+				return r;
+			}
+			throw new ApiError("user preferences key not found: " + name + " (see get_user_preferences)");
+		}
+
+		// ===================== scene / template browser =====================
+
+		public JSONNode SceneBrowser(JSONNode args) {
+			string action = S(args, "action").ToLowerInvariant();
+			if (action == "list") return ListScenes(args);
+			if (action == "load") return LoadScene(args);
+			if (action == "new") return NewScene();
+			if (action == "save") return SaveScene(args);
+			if (action == "delete") {
+				string path = S(args, "path");
+				if (path == "") throw new ApiError("path required");
+				if (S(args, "confirm").ToLowerInvariant() != "true") throw new ApiError("delete requires confirm:true (scene files are not recoverable)");
+				if (!FileManagerSecure.FileExists(path)) throw new ApiError("scene file not found: " + path);
+				string abs = Application.dataPath + "/.." + (path.StartsWith("/") ? "" : "/") + path;
+				System.IO.File.Delete(abs);
+				JSONClass r = new JSONClass();
+				r["deleted"] = path;
+				return r;
+			}
+			throw new ApiError("action required: List, Load, New, Save, Delete");
+		}
+
+		public JSONNode TemplateBrowser(JSONNode args) {
+			string action = S(args, "action").ToLowerInvariant();
+			if (action == "list") {
+				JSONClass r = new JSONClass();
+				r["looks"] = ListLooks(args)["count"];
+				r["poses"] = ListPoses(args)["count"];
+				r["scenes"] = ListScenes(args)["count"];
+				r["clothing"] = ListClothingPresets(args)["count"];
+				r["hair"] = ListHairPresets(args)["count"];
+				r["note"] = "templates = look/pose/scene/clothing/hair presets; pass a category to Load";
+				return r;
+			}
+			if (action == "load") {
+				string cat = S(args, "category").ToLowerInvariant();
+				if (cat == "look") return LoadLook(args);
+				if (cat == "pose") return LoadPose(args);
+				if (cat == "scene") return LoadScene(args);
+				if (cat == "clothing") return LoadClothingPreset(args);
+				if (cat == "hair") return LoadHairPreset(args);
+				throw new ApiError("category required: look, pose, scene, clothing or hair");
+			}
+			throw new ApiError("action required: List or Load");
+		}
+
+		// ===================== atom UI (control, move, geometry) =====================
+
+		public JSONNode AtomControl(JSONNode args) {
+			Atom a = FindAtom(S(args, "uid"));
+			string la = S(args, "action").ToLowerInvariant();
+			if (la == "" ) throw new ApiError("action required: Select, FreezePhysics, UnfreezePhysics, DisableCollision, EnableCollision, IsolateEdit, EndIsolate, SetNameSpace");
+			JSONClass r = new JSONClass();
+			r["uid"] = a.uid;
+			if (la == "select") {
+				Exception last = null;
+				foreach (string m in new string[] { "SelectAtom", "SetSelectedAtom", "Select" }) {
+					try {
+						if (m == "Select") Invoke(SC, "SelectAtom", a);
+						else Invoke(SC, m, a);
+						r["selected"] = JSONRaw.Bool(true);
+						r["via"] = m;
+						return r;
+					} catch (Exception e) { last = e; }
+				}
+				throw new ApiError("atom selection not available via any known API (" + (last != null ? last.Message : "no match") + "); click the atom in the VaM scene panel instead");
+			}
+			if (la == "freezephysics" || la == "unfreezephysics") {
+				bool freeze = la == "freezephysics";
+				int touched = 0;
+				// physics freeze = the FreeControllerV3 position/rotation state choosers ("Freeze" vs "Off" = physics-driven)
+				string wantState = freeze ? "Freeze" : "Off";
+				foreach (string sid in a.GetStorableIDs()) {
+					if (!sid.EndsWith("Control", StringComparison.OrdinalIgnoreCase) && sid != "control") continue;
+					JSONStorable st = a.GetStorableByID(sid);
+					if (st == null) continue;
+					try {
+						string ps = MatchChooserParam(st, "positionState");
+						string rs = MatchChooserParam(st, "rotationState");
+						if (ps != null) { st.SetStringChooserParamValue(ps, wantState); touched++; r[sid + ".positionState"] = st.GetStringChooserParamValue(ps); }
+						if (rs != null) { st.SetStringChooserParamValue(rs, wantState); touched++; r[sid + ".rotationState"] = st.GetStringChooserParamValue(rs); }
+					} catch (Exception e) { r[sid + ".error"] = e.Message; }
+				}
+				r["touched"] = JSONRaw.Num(touched);
+				r["note"] = freeze ? "controllers forced to Freeze (physics stops moving them); UnfreezePhysics sets them back to Off (physics-driven)"
+					: "controllers returned to Off (physics-driven); a captured On-state pose would need set_control";
+				return r;
+			}
+			bool enableCollision = la == "enablecollision";
+			if (la == "disablecollision" || enableCollision) {
+				int touched = 0;
+				foreach (string sid in a.GetStorableIDs()) {
+					JSONStorable st = a.GetStorableByID(sid);
+					if (st == null) continue;
+					string p = MatchBoolParam(st, "collision");
+					if (p == null) continue;
+					st.SetBoolParamValue(p, enableCollision);
+					touched++;
+					r[sid + "." + p] = JSONRaw.Bool(st.GetBoolParamValue(p));
+				}
+				r["touched"] = JSONRaw.Num(touched);
+				return r;
+			}
+			if (la == "isolateedit" || la == "endisolate") {
+				bool want = la == "isolateedit";
+				Exception last = null;
+				foreach (string m in new string[] { "SetAtomIsolate", "IsolateAtom", "ToggleIsolate" }) {
+					try { Invoke(SC, m, a, want); r["isolate"] = JSONRaw.Bool(want); r["via"] = m; return r; } catch (Exception e) { last = e; }
+				}
+				foreach (string m in new string[] { "Isolate", "EndIsolate" }) {
+					try { Invoke(a, m); r["isolate"] = JSONRaw.Bool(want); r["via"] = m; return r; } catch (Exception e) { last = e; }
+				}
+				throw new ApiError("isolate not available via any known API (" + (last != null ? last.Message : "no match") + "); use VaM's scene editor isolation instead");
+			}
+			if (la == "disablerender" || la == "enablerender") {
+				// hiding an atom safely = VaM's own on toggle; killing mainController GameObjects breaks physics
+				JSONNode sub = new JSONClass();
+				sub["uid"] = a.uid;
+				sub["on"] = JSONRaw.Bool(la == "enablerender");
+				JSONNode res = SetAtomOn(sub);
+				res["note"] = "DisableRender/EnableRender are mapped to the atom power toggle (VaM has no per-atom render-only hide without plugins)";
+				return res;
+			}
+			if (la == "setnamespace") {
+				throw new ApiError("SetNameSpace is not supported: nameSpace systems are plugin-specific; nothing settable here");
+			}
+			throw new ApiError("unknown atom action: " + S(args, "action"));
+		}
+
+		public JSONNode AtomMove(JSONNode args) {
+			Atom a = FindAtom(S(args, "uid"));
+			string la = S(args, "action").ToLowerInvariant();
+			if (la == "" ) throw new ApiError("action required: SetPosition, SetRotation, SetScale, SnapToGround, AlignTo, ResetTransform");
+			JSONClass r = new JSONClass();
+			r["uid"] = a.uid;
+			if (la == "setposition" || la == "setrotation" || la == "setscale") {
+				JSONNode sub = new JSONClass();
+				sub["uid"] = a.uid;
+				if (la == "setposition") sub["position"] = args["value"];
+				if (la == "setrotation") sub["rotation"] = args["value"];
+				if (la == "setscale") sub["scale"] = args["value"];
+				return SetAtomTransform(sub);
+			}
+			if (la == "resettransform") {
+				JSONNode sub = new JSONClass();
+				sub["uid"] = a.uid;
+				sub["position"] = new JSONArray();
+				sub["position"].Add(F(0f)); sub["position"].Add(F(0f)); sub["position"].Add(F(0f));
+				sub["rotation"] = new JSONArray();
+				sub["rotation"].Add(F(0f)); sub["rotation"].Add(F(0f)); sub["rotation"].Add(F(0f));
+				sub["scale"] = new JSONArray();
+				sub["scale"].Add(F(1f)); sub["scale"].Add(F(1f)); sub["scale"].Add(F(1f));
+				return SetAtomTransform(sub);
+			}
+			if (la == "alignto") {
+				Atom target = FindAtom(S(args, "target_uid"));
+				JSONNode sub = new JSONClass();
+				sub["uid"] = a.uid;
+				sub["position"] = Vec(target.transform.position);
+				sub["rotation"] = Vec(target.transform.eulerAngles);
+				if (Bool(args, "scale", false)) sub["scale"] = Vec(target.transform.localScale);
+				r["alignedTo"] = target.uid;
+				JSONNode res = SetAtomTransform(sub);
+				res["alignedTo"] = target.uid;
+				return res;
+			}
+			if (la == "snaptoground") {
+				// honest best-effort: drop the atom so its lowest reported bbox Y matches y=0;
+				// VaM has no baked-in snap API here, so we use the renderer bounds of the atom's collider/renderer.
+				Mt.Run(delegate {
+					Renderer[] rs = a.GetComponentsInChildren<Renderer>();
+					if (rs != null && rs.Length > 0) {
+						Bounds b = rs[0].bounds;
+						for (int i = 1; i < rs.Length; i++) b.Encapsulate(rs[i].bounds);
+						a.transform.position = new Vector3(a.transform.position.x, a.transform.position.y - b.min.y, a.transform.position.z);
+						r["newY"] = F(a.transform.position.y);
+						return;
+					}
+					a.transform.position = new Vector3(a.transform.position.x, 0f, a.transform.position.z);
+					r["newY"] = F(0f);
+				}, 10000);
+				r["note"] = "snapped via renderer bounds (when present) or dropped to y=0";
+				return r;
+			}
+			throw new ApiError("unknown atom move action: " + S(args, "action"));
+		}
+
+		public JSONNode AtomGeometryChoices(JSONNode args) {
+			Atom a = FindAtom(S(args, "uid"));
+			string la = S(args, "action").ToLowerInvariant();
+			if (la == "") throw new ApiError("action required: List or Select");
+			string used;
+			JSONStorable st = ResolveStorable(a, S(args, "storable") != "" ? S(args, "storable") : "asset", "asset", out used);
+			if (st == null) throw new ApiError("no asset storable on " + a.uid + "; storables: " + string.Join(", ", a.GetStorableIDs().ToArray()));
+			JSONClass r = new JSONClass();
+			r["uid"] = a.uid;
+			r["storable"] = used;
+			if (la == "list") {
+				JSONArray ch = new JSONArray();
+				foreach (string name in SortedNames(st.GetStringChooserParamNames())) {
+					JSONClass row = new JSONClass();
+					row["param"] = name;
+					try {
+						row["value"] = st.GetStringChooserParamValue(name);
+						JSONStorableStringChooser obj = GetChooserObj(st, name);
+						if (obj != null && obj.choices != null) {
+							JSONArray choices = new JSONArray();
+							foreach (string c in obj.choices) choices.Add(c);
+							row["choices"] = choices;
+						}
+					} catch (Exception e) { row["error"] = e.Message; }
+					ch.Add(row);
+				}
+				r["choosers"] = ch;
+				return r;
+			}
+			if (la == "select") {
+				string p = S(args, "param");
+				if (p == "") p = MatchChooserParam(st, "assetName");
+				if (p == null) throw new ApiError("no assetName chooser; " + ActionHelp(st));
+				string choice = S(args, "choice");
+				st.SetStringChooserParamValue(p, choice);
+				r["param"] = p;
+				r["value"] = st.GetStringChooserParamValue(p);
+				return r;
+			}
+			throw new ApiError("unknown action: " + S(args, "action"));
+		}
+
+		// ===================== person animation =====================
+
+		public JSONNode PersonAnimation(JSONNode args) {
+			Atom p = RequirePerson(S(args, "person"));
+			string la = S(args, "action").ToLowerInvariant();
+			if (la == "") throw new ApiError("action required: ArmRecord, RecordAnimation, PlaybackEnabled, PlayAnimation, StopAnimation");
+			JSONClass r = new JSONClass();
+			r["uid"] = p.uid;
+			// find the per-person animation storable (id pattern varies by setup)
+			JSONStorable st = null;
+			string used = "";
+			foreach (string sid in p.GetStorableIDs()) {
+				if (sid.IndexOf("animation", StringComparison.OrdinalIgnoreCase) < 0) continue;
+				st = p.GetStorableByID(sid);
+				used = sid;
+				break;
+			}
+			if (st == null) {
+				throw new ApiError("no animation storable on " + p.uid + "; VaM drives person animation via AnimationPattern atoms (list_animation_patterns) or pose presets (load_pose); a plugin may be needed for bone recording");
+			}
+			r["storable"] = used;
+			if (la == "armrecord" || la == "recordanimation") {
+				JSONStorableAction act = FindActionCI(st, "record");
+				if (act == null) act = FindActionCI(st, "arm");
+				if (act == null) act = FindActionCI(st, "start");
+				if (act != null && act.actionCallback != null) { act.actionCallback(); r["called"] = act.name; return r; }
+				string bp = MatchBoolParam(st, "record");
+				if (bp != null) { st.SetBoolParamValue(bp, true); r[bp] = JSONRaw.Bool(st.GetBoolParamValue(bp)); return r; }
+				throw new ApiError("no record action/param on " + used + "; " + ActionHelp(st));
+			}
+			if (la == "playbackenabled") {
+				string bp = MatchBoolParam(st, "playback");
+				if (bp == null) bp = MatchBoolParam(st, "enabled");
+				if (bp == null) throw new ApiError("no playback param on " + used + "; " + ActionHelp(st));
+				st.SetBoolParamValue(bp, Bool(args, "value", true));
+				r[bp] = JSONRaw.Bool(st.GetBoolParamValue(bp));
+				return r;
+			}
+			if (la == "playanimation" || la == "stopanimation") {
+				bool play = la == "playanimation";
+				JSONStorableAction act = FindActionCI(st, play ? "play" : "stop");
+				if (act != null && act.actionCallback != null) { act.actionCallback(); r["called"] = act.name; return r; }
+				string bp = MatchBoolParam(st, "play");
+				if (bp == null) bp = MatchBoolParam(st, "playing");
+				if (bp != null) { st.SetBoolParamValue(bp, play); r[bp] = JSONRaw.Bool(st.GetBoolParamValue(bp)); return r; }
+				throw new ApiError("no play/stop control on " + used + "; " + ActionHelp(st));
+			}
+			throw new ApiError("unknown animation action: " + S(args, "action") + "; " + ActionHelp(st));
+		}
+
+		// ===================== custom unity assets =====================
+
+		public JSONNode ListCUA(JSONNode args) {
+			JSONArray arr = new JSONArray();
+			foreach (Atom a in SC.GetAtoms()) {
+				if (a == null) continue;
+				if (!AtomTypeMatches(a, "CustomUnityAsset")) continue;
+				JSONClass row = AtomInfo(a);
+				string used;
+				JSONStorable st = ResolveStorable(a, "asset", "asset", out used);
+				if (st != null) {
+					row["storable"] = used;
+					string up = MatchUrlParam(st, "assetUrl");
+					if (up != null) row["assetUrl"] = st.GetUrlParamValue(up);
+					string cp = MatchChooserParam(st, "assetName");
+					if (cp != null) row["assetName"] = st.GetStringChooserParamValue(cp);
+					string pb = MatchBoolParam(st, "loaded");
+					if (pb != null) row["loaded"] = JSONRaw.Bool(st.GetBoolParamValue(pb));
+				}
+				arr.Add(row);
+			}
+			JSONClass r = new JSONClass();
+			r["count"] = JSONRaw.Num(arr.Count);
+			r["cuas"] = arr;
+			return r;
+		}
+
+		public JSONNode CUAAction(JSONNode args) {
+			Atom a = FindAtom(S(args, "uid"));
+			string la = S(args, "action").ToLowerInvariant();
+			if (la == "" ) throw new ApiError("action required: SetAssetUrl, SetAssetName, LoadAsset, UnloadAsset, ReloadAsset");
+			JSONClass r = new JSONClass();
+			r["uid"] = a.uid;
+			string used;
+			JSONStorable st = ResolveStorable(a, "asset", "asset", out used);
+			if (st == null) throw new ApiError("no asset storable on " + a.uid + "; storables: " + string.Join(", ", a.GetStorableIDs().ToArray()));
+			r["storable"] = used;
+			if (la == "setasseturl") {
+				string p = MatchUrlParam(st, "assetUrl");
+				if (p == null) throw new ApiError("no assetUrl url param; " + ActionHelp(st));
+				st.SetUrlParamValue(p, S(args, "value"));
+				r["assetUrl"] = st.GetUrlParamValue(p);
+				return r;
+			}
+			if (la == "setassetname") {
+				string p = MatchChooserParam(st, "assetName");
+				if (p == null) throw new ApiError("no assetName chooser; " + ActionHelp(st));
+				st.SetStringChooserParamValue(p, S(args, "value"));
+				r["assetName"] = st.GetStringChooserParamValue(p);
+				return r;
+			}
+			foreach (string n in st.GetActionNames()) {
+				string ln = n.ToLowerInvariant();
+				bool hit = (la == "loadasset" && ln.IndexOf("load") >= 0 && ln.IndexOf("unload") < 0) ||
+					(la == "unloadasset" && ln.IndexOf("unload") >= 0) ||
+					(la == "reloadasset" && (ln.IndexOf("reload") >= 0 || ln.IndexOf("reset") >= 0));
+				if (hit) {
+					JSONStorableAction act = st.GetAction(n);
+					if (act != null && act.actionCallback != null) { act.actionCallback(); r["called"] = n; return r; }
+				}
+			}
+			throw new ApiError("CUA load flows through setting assetUrl/assetName (SetAssetUrl/SetAssetName); no LoadAsset-style action on this atom: " + ActionHelp(st));
+		}
+
+		// ===================== package manager =====================
+
+		public JSONNode PackageManager(JSONNode args) {
+			string action = S(args, "action").ToLowerInvariant();
+			if (action == "listenabled" || action == "list") {
+				return ListPackages();
+			}
+			if (action == "scanpackages" || action == "refreshpackages") {
+				Exception last = null;
+				foreach (string m in new string[] { "StartAddonPackageScan", "ScanPackages", "RefreshPackages", "RefreshAddonPackages" }) {
+					try { Invoke(SC, m); JSONClass r = new JSONClass(); r["called"] = m; r["ok"] = JSONRaw.Bool(true); return r; } catch (Exception e) { last = e; }
+				}
+				throw new ApiError("package rescan not available via any known API (" + (last != null ? last.Message : "no match") + "); restart VaM to rescan AddonPackages");
+			}
+			if (action == "enablepackage" || action == "disablepackage") {
+				throw new ApiError("per-package enable/disable is only exposed in VaM's own Package Manager UI; to remove a package, move its .var file out of AddonPackages (or use action=deletepackage)");
+			}
+			if (action == "deletepackage") {
+				string pkg = S(args, "package");
+				if (pkg == "") throw new ApiError("package required (file name of an installed .var)");
+				if (S(args, "confirm").ToLowerInvariant() != "true") throw new ApiError("delete requires confirm:true (.var files are not recoverable from this plugin)");
+				if (!pkg.EndsWith(".var")) pkg += ".var";
+				string dir = Application.dataPath + "/../AddonPackages";
+				string found = null;
+				foreach (string f in System.IO.Directory.GetFiles(dir, "*.var")) {
+					if (string.Equals(System.IO.Path.GetFileName(f), pkg, StringComparison.OrdinalIgnoreCase)) { found = f; break; }
+				}
+				if (found == null) throw new ApiError("package not found in AddonPackages: " + pkg);
+				System.IO.File.Delete(found);
+				JSONClass r = new JSONClass();
+				r["deleted"] = System.IO.Path.GetFileName(found);
+				r["note"] = "the package disappears after VaM rescans; a running scene referencing it keeps working until reload";
+				return r;
+			}
+			throw new ApiError("action required: ScanPackages, RefreshPackages, ListEnabled, EnablePackage, DisablePackage, DeletePackage");
+		}
+
+		// ===================== scene state inspection / debugging =====================
+
+		public JSONNode SceneState(JSONNode args) {
+			string detail = S(args, "detail").ToLowerInvariant();
+			if (detail == "") detail = "summary";
+			Dictionary<string, int> byType = new Dictionary<string, int>();
+			JSONClass r = new JSONClass();
+			r["plugin"] = "VaMMCP";
+			r["time"] = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+			foreach (Atom a in SC.GetAtoms()) {
+				if (a == null) continue;
+				if (!byType.ContainsKey(a.type)) byType[a.type] = 0;
+				byType[a.type]++;
+			}
+			JSONArray types = new JSONArray();
+			int atoms = 0;
+			foreach (KeyValuePair<string, int> kv in byType) {
+				JSONClass row = new JSONClass();
+				row["type"] = kv.Key;
+				row["count"] = JSONRaw.Num(kv.Value);
+				types.Add(row);
+				atoms += kv.Value;
+			}
+			r["atoms"] = JSONRaw.Num(atoms);
+			r["atomTypes"] = types;
+			r["timeScale"] = F(Time.timeScale);
+			try { r["loadingScene"] = JSONRaw.Bool(SC.isLoading); } catch { }
+			try {
+				Camera cam = SC.MonitorCenterCamera;
+				if (cam != null) {
+					r["camera"] = new JSONClass();
+					r["camera"]["position"] = Vec(cam.transform.position);
+					r["camera"]["rotation"] = Vec(cam.transform.eulerAngles);
+				}
+			} catch { }
+			if (detail == "persons" || detail == "full") {
+				JSONNode summary = ListPersons();
+				r["persons"] = summary["persons"];
+			}
+			if (detail == "plugins" || detail == "full") {
+				JSONNode plugins = ListPlugins(new JSONClass());
+				r["plugins"] = plugins["plugins"];
+				r["pluginCount"] = plugins["count"];
+			}
+			if (detail == "physics" || detail == "full") {
+				r["physics"] = ListPhysicsObjects(new JSONClass())["objects"];
+			}
+			return r;
+		}
+
+		private static void AtomTreeWalk(Transform t, int depth, int maxDepth, JSONArray outArr, int cap) {
+			if (outArr.Count >= cap) return;
+			JSONClass node = new JSONClass();
+			node["name"] = t.name;
+			StringBuilder comps = new StringBuilder();
+			Component[] cs = t.GetComponents<Component>();
+			if (cs != null) {
+				for (int i = 0; i < cs.Length; i++) {
+					if (cs[i] == null) { comps.Append("(missing);"); continue; }
+					comps.Append(cs[i].GetType().Name);
+					comps.Append(";");
+				}
+			}
+			node["components"] = comps.ToString();
+			node["depth"] = JSONRaw.Num(depth);
+			if (t.parent != null) node["parent"] = t.parent.name;
+			outArr.Add(node);
+			if (depth >= maxDepth) return;
+			foreach (Transform c in t) AtomTreeWalk(c, depth + 1, maxDepth, outArr, cap);
+		}
+
+		public JSONNode AtomTree(JSONNode args) {
+			string rootUid = S(args, "root_uid");
+			int maxDepth = (int)Num(args, "max_depth", 2);
+			if (maxDepth < 1) maxDepth = 1;
+			if (maxDepth > 5) maxDepth = 5;
+			JSONArray arr = new JSONArray();
+			if (rootUid != "") {
+				Atom a = FindAtom(rootUid);
+				JSONClass info = AtomInfo(a);
+				JSONArray nodes = new JSONArray();
+				AtomTreeWalk(a.mainController != null ? a.mainController.transform : a.transform, 0, maxDepth, nodes, 400);
+				info["nodes"] = nodes;
+				info["nodeLimit"] = JSONRaw.Num(400);
+				JSONArray single = new JSONArray();
+				single.Add(info);
+				arr = single;
+			} else {
+				foreach (Atom a in SC.GetAtoms()) {
+					if (a == null) continue;
+					JSONClass info = AtomInfo(a);
+					JSONArray nodes = new JSONArray();
+					AtomTreeWalk(a.mainController != null ? a.mainController.transform : a.transform, 0, 1, nodes, 12);
+					info["nodes"] = nodes;
+					arr.Add(info);
+					if (arr.Count >= 60) break;
+				}
+			}
+			JSONClass r = new JSONClass();
+			r["count"] = JSONRaw.Num(arr.Count);
+			r["atoms"] = arr;
+			return r;
+		}
+
+		public JSONNode PersonState(JSONNode args) {
+			Atom p = RequirePerson(S(args, "person"));
+			bool includeHidden = Bool(args, "include_hidden", false);
+			JSONClass r = new JSONClass();
+			r["uid"] = p.uid;
+			try {
+				DAZCharacterSelector sel = Selector(p);
+				try { r["character"] = sel.GetStringChooserParamValue("characterSelection"); } catch { r["character"] = ""; }
+				r["gender"] = sel.gender.ToString();
+				int morphs = 0;
+				JSONArray top = new JSONArray();
+				foreach (DAZMorph m in AllMorphs(sel)) {
+					try {
+						float v = m.morphValue;
+						if (Math.Abs(v) < 0.0005f) {
+							if (includeHidden) { morphs++; }
+							continue;
+						}
+						morphs++;
+						if (top.Count < 40) {
+							JSONClass row = new JSONClass();
+							row["name"] = m.displayName;
+							row["value"] = F(v);
+							top.Add(row);
+						}
+					} catch { }
+				}
+				r["nonZeroMorphs"] = JSONRaw.Num(morphs);
+				r["topMorphs"] = top;
+			} catch (Exception e) { r["morphs.error"] = e.Message; }
+			JSONNode cloth = ListClothingItems(args);
+			r["clothingCount"] = cloth["count"];
+			JSONNode hair = ListHairItems(args);
+			r["hairCount"] = hair["count"];
+			JSONClass controls = new JSONClass();
+			foreach (string id in p.GetStorableIDs()) {
+				if (id.EndsWith("Control", StringComparison.OrdinalIgnoreCase)) controls[id] = JSONRaw.Bool(true);
+			}
+			r["controls"] = controls;
+			return r;
+		}
+
+		public JSONNode PhysicsState() {
+			JSONClass r = new JSONClass();
+			r["timeScale"] = F(Time.timeScale);
+			r["fixedDeltaTime"] = F(Time.fixedDeltaTime);
+			JSONNode objs = ListPhysicsObjects(new JSONClass());
+			r["physicsObjectCount"] = objs["count"];
+			r["objects"] = objs["objects"];
+			return r;
+		}
+
+		public JSONNode SimulationPerformance() {
+			JSONClass r = new JSONClass();
+			r["frameCount"] = JSONRaw.Num(Time.frameCount);
+			r["deltaTime"] = F(Time.deltaTime);
+			r["unscaledDeltaTime"] = F(Time.unscaledDeltaTime);
+			r["timeScale"] = F(Time.timeScale);
+			r["realtimeSinceStartup"] = F(Time.realtimeSinceStartup);
+			r["maxDelta"] = F(Time.maximumDeltaTime);
+			try { r["vSync"] = JSONRaw.Num(QualitySettings.vSyncCount); } catch { }
+			r["gcHeapBytes"] = JSONRaw.Num(GC.GetTotalMemory(false));
+			int atoms = 0;
+			foreach (Atom a in SC.GetAtoms()) if (a != null) atoms++;
+			r["atoms"] = JSONRaw.Num(atoms);
+			return r;
+		}
+
+		private static bool ParamValueMatches(JSONStorable st, string name, string kind, string want) {
+			try {
+				if (kind == "float") {
+					float v = st.GetFloatParamValue(name);
+					float w;
+					return float.TryParse(want, out w) ? Math.Abs(v - w) < 1e-5f : false;
+				}
+				if (kind == "bool") {
+					bool v = st.GetBoolParamValue(name);
+					return v ? (want == "true" || want == "1") : (want == "false" || want == "0");
+				}
+				if (kind == "string") return string.Equals(st.GetStringParamValue(name), want, StringComparison.OrdinalIgnoreCase);
+				if (kind == "chooser") return string.Equals(st.GetStringChooserParamValue(name), want, StringComparison.OrdinalIgnoreCase);
+			} catch { }
+			return false;
+		}
+
+		public JSONNode FindAtoms(JSONNode args) {
+			string nameF = S(args, "name");
+			string typeF = S(args, "type");
+			string compF = S(args, "component");
+			string propF = S(args, "property");
+			string valF = S(args, "value");
+			string tagF = S(args, "tag");
+			if (tagF != "") throw new ApiError("tag filter is not supported by VaM's runtime; use name/type/component/property filters");
+			JSONArray arr = new JSONArray();
+			foreach (Atom a in SC.GetAtoms()) {
+				if (a == null) continue;
+				if (nameF != "" && a.uid.IndexOf(nameF, StringComparison.OrdinalIgnoreCase) < 0
+					&& (a.name == null || a.name.IndexOf(nameF, StringComparison.OrdinalIgnoreCase) < 0)) continue;
+				if (typeF != "" && !string.Equals(a.type, typeF, StringComparison.OrdinalIgnoreCase)) continue;
+				bool keep = nameF == "" && typeF == "";
+				if (compF != "") {
+					if (a.mainController == null) continue;
+					Component[] cs = a.mainController.GetComponentsInChildren<Component>(true);
+					bool found = false;
+					foreach (Component c in cs) {
+						if (c != null && c.GetType().Name.IndexOf(compF, StringComparison.OrdinalIgnoreCase) >= 0) { found = true; break; }
+					}
+					if (!found) continue;
+					keep = true;
+				}
+				if (propF != "") {
+					bool matched = false;
+					foreach (string sid in a.GetStorableIDs()) {
+						if (matched) break;
+						JSONStorable st = a.GetStorableByID(sid);
+						if (st == null) continue;
+						foreach (string n in st.GetFloatParamNames()) {
+							if ((n.IndexOf(propF, StringComparison.OrdinalIgnoreCase) >= 0 || string.Equals(n, propF, StringComparison.OrdinalIgnoreCase))
+								&& (valF == "" || ParamValueMatches(st, n, "float", valF))) { matched = true; break; }
+						}
+						if (matched) break;
+						foreach (string n in st.GetBoolParamNames()) {
+							if ((n.IndexOf(propF, StringComparison.OrdinalIgnoreCase) >= 0 || string.Equals(n, propF, StringComparison.OrdinalIgnoreCase))
+								&& (valF == "" || ParamValueMatches(st, n, "bool", valF))) { matched = true; break; }
+						}
+						if (matched) break;
+						foreach (string n in st.GetStringChooserParamNames()) {
+							if ((n.IndexOf(propF, StringComparison.OrdinalIgnoreCase) >= 0 || string.Equals(n, propF, StringComparison.OrdinalIgnoreCase))
+								&& (valF == "" || ParamValueMatches(st, n, "chooser", valF))) { matched = true; break; }
+						}
+						if (matched) break;
+						foreach (string n in st.GetStringParamNames()) {
+							if ((n.IndexOf(propF, StringComparison.OrdinalIgnoreCase) >= 0 || string.Equals(n, propF, StringComparison.OrdinalIgnoreCase))
+								&& (valF == "" || ParamValueMatches(st, n, "string", valF))) { matched = true; break; }
+						}
+					}
+					if (!matched) continue;
+					keep = true;
+				}
+				if (!keep) continue;
+				arr.Add(AtomInfo(a));
+				if (arr.Count >= 100) break;
+			}
+			JSONClass r = new JSONClass();
+			r["count"] = JSONRaw.Num(arr.Count);
+			r["matches"] = arr;
+			if (arr.Count >= 100) r["note"] = "result truncated at 100 atoms";
+			return r;
+		}
+
+		private static void CollectParamMap(JSONStorable st, Dictionary<string, float> floats, Dictionary<string, bool> bools, Dictionary<string, string> values, int cap) {
+			int i = 0;
+			foreach (string n in st.GetFloatParamNames()) {
+				if (i++ >= cap) break;
+				try { floats[n] = st.GetFloatParamValue(n); } catch { }
+			}
+			i = 0;
+			foreach (string n in st.GetBoolParamNames()) {
+				if (i++ >= cap) break;
+				try { bools[n] = st.GetBoolParamValue(n); } catch { }
+			}
+			i = 0;
+			foreach (string n in st.GetStringChooserParamNames()) {
+				if (i++ >= cap) break;
+				try { values[n] = st.GetStringChooserParamValue(n); } catch { }
+			}
+			i = 0;
+			foreach (string n in st.GetStringParamNames()) {
+				if (i++ >= cap) break;
+				try { values[n] = st.GetStringParamValue(n); } catch { }
+			}
+		}
+
+		public JSONNode StorableDiff(JSONNode args) {
+			Atom a = FindAtom(S(args, "uid_a"));
+			Atom b = FindAtom(S(args, "uid_b"));
+			JSONStorable sa = RequireResolvedStorable(a, S(args, "storable_a"), null, "storable A");
+			JSONStorable sb = RequireResolvedStorable(b, S(args, "storable_b"), null, "storable B");
+			Dictionary<string, float> fa = new Dictionary<string, float>();
+			Dictionary<string, bool> ba = new Dictionary<string, bool>();
+			Dictionary<string, string> va = new Dictionary<string, string>();
+			Dictionary<string, float> fb = new Dictionary<string, float>();
+			Dictionary<string, bool> bb = new Dictionary<string, bool>();
+			Dictionary<string, string> vb = new Dictionary<string, string>();
+			CollectParamMap(sa, fa, ba, va, 200);
+			CollectParamMap(sb, fb, bb, vb, 200);
+			int same = 0, diff = 0;
+			JSONArray diffs = new JSONArray();
+			JSONArray onlyA = new JSONArray();
+			JSONArray onlyB = new JSONArray();
+			foreach (KeyValuePair<string, float> kv in fa) {
+				if (!fb.ContainsKey(kv.Key)) { onlyA.Add(kv.Key); continue; }
+				if (Math.Abs(kv.Value - fb[kv.Key]) > 1e-5f) {
+					JSONClass row = new JSONClass();
+					row["param"] = kv.Key;
+					row["a"] = F(kv.Value);
+					row["b"] = F(fb[kv.Key]);
+					diffs.Add(row);
+					diff++;
+				} else same++;
+			}
+			foreach (KeyValuePair<string, bool> kv in ba) {
+				if (!bb.ContainsKey(kv.Key)) { onlyA.Add(kv.Key); continue; }
+				if (kv.Value != bb[kv.Key]) {
+					JSONClass row = new JSONClass();
+					row["param"] = kv.Key;
+					row["a"] = JSONRaw.Bool(kv.Value);
+					row["b"] = JSONRaw.Bool(bb[kv.Key]);
+					diffs.Add(row);
+					diff++;
+				} else same++;
+			}
+			foreach (KeyValuePair<string, string> kv in va) {
+				if (!vb.ContainsKey(kv.Key)) { onlyA.Add(kv.Key); continue; }
+				if (!string.Equals(kv.Value, vb[kv.Key], StringComparison.OrdinalIgnoreCase)) {
+					JSONClass row = new JSONClass();
+					row["param"] = kv.Key;
+					row["a"] = kv.Value != null && kv.Value.Length > 160 ? kv.Value.Substring(0, 160) + "..." : kv.Value;
+					row["b"] = vb[kv.Key] != null && vb[kv.Key].Length > 160 ? vb[kv.Key].Substring(0, 160) + "..." : vb[kv.Key];
+					diffs.Add(row);
+					diff++;
+				} else same++;
+			}
+			foreach (string k in fb.Keys) if (!fa.ContainsKey(k)) onlyB.Add(k);
+			foreach (string k in bb.Keys) if (!ba.ContainsKey(k)) onlyB.Add(k);
+			foreach (string k in vb.Keys) if (!va.ContainsKey(k) && !fb.ContainsKey(k)) onlyB.Add(k);
+			JSONClass r = new JSONClass();
+			r["same"] = JSONRaw.Num(same);
+			r["different"] = JSONRaw.Num(diff);
+			r["onlyInA"] = onlyA;
+			r["onlyInB"] = onlyB;
+			r["diffs"] = diffs;
+			return r;
+		}
+
+		public JSONNode SceneDependencies() {
+			HashSet<string> installed = new HashSet<string>();
+			try {
+				string dir = Application.dataPath + "/../AddonPackages";
+				foreach (string f in System.IO.Directory.GetFiles(dir, "*.var")) {
+					installed.Add(System.IO.Path.GetFileName(f));
+				}
+			} catch { }
+			HashSet<string> seen = new HashSet<string>();
+			JSONArray rows = new JSONArray();
+			foreach (Atom a in SC.GetAtoms()) {
+				if (a == null) continue;
+				JSONClass row = new JSONClass();
+				foreach (string sid in a.GetStorableIDs()) {
+					JSONStorable st = a.GetStorableByID(sid);
+					if (st == null) continue;
+					string[] urls = null;
+					try { urls = st.GetUrlParamNames().ToArray(); } catch { continue; }
+					if (urls == null) continue;
+					foreach (string n in urls) {
+						string v;
+						try { v = st.GetUrlParamValue(n); } catch { continue; }
+						if (v == null || v == "" || seen.Contains(v)) continue;
+						seen.Add(v);
+						row["atom"] = a.uid;
+						row["storable"] = sid;
+						row["param"] = n;
+						row["path"] = v;
+						string pak = v.IndexOf(":") >= 0 ? v.Substring(0, v.IndexOf(":")) : "";
+						bool missing = pak != "" && !installed.Contains(pak) && !System.IO.File.Exists(Application.dataPath + "/../" + v.Replace('/', System.IO.Path.DirectorySeparatorChar));
+						row["missing"] = JSONRaw.Bool(missing);
+						rows.Add(row);
+						if (rows.Count >= 80) return FinishRefs(rows, seen);
+					}
+				}
+			}
+			return FinishRefs(rows, seen);
+		}
+
+		private static JSONNode FinishRefs(JSONArray rows, HashSet<string> seen) {
+			JSONClass rr = new JSONClass();
+			rr["count"] = JSONRaw.Num(rows.Count);
+			rr["refs"] = rows;
+			rr["unique"] = JSONRaw.Num(seen.Count);
+			rr["note"] = "scans url params for package paths (name.N:/rev or disk); missing=true when no matching .var and the file does not exist";
+			return rr;
+		}
+
+		public JSONNode PerformanceProfile(JSONNode args) {
+			float durationMs = Num(args, "duration_ms", 3000f);
+			if (durationMs < 250f) durationMs = 250f;
+			if (durationMs > 30000f) durationMs = 30000f;
+			DateTime end = DateTime.UtcNow.AddMilliseconds(durationMs);
+			int lastFrame = -1;
+			int frames = 0;
+			List<float> sampleMs = new List<float>();
+			float stallTime = 0f;
+			const int win = 50;
+			while (DateTime.UtcNow < end) {
+				System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
+				bool advanced = false;
+				DateTime frameStarted = DateTime.UtcNow;
+				while (sw.Elapsed.TotalMilliseconds < win) {
+					int fc = Time.frameCount;
+					if (lastFrame == -1) lastFrame = fc;
+					if (fc > lastFrame) {
+						if (!advanced && frames > 0) {
+							float gap = (float)(DateTime.UtcNow - frameStarted).TotalMilliseconds;
+							sampleMs.Add(gap);
+						}
+						advanced = true;
+						lastFrame = fc;
+						frames++;
+						frameStarted = DateTime.UtcNow;
+					}
+					Thread.Sleep(1);
+				}
+				if (!advanced) stallTime += (float)sw.Elapsed.TotalMilliseconds;
+			}
+			float avg = 0f;
+			float min = 0f, max = 0f;
+			if (sampleMs.Count > 0) {
+				min = sampleMs[0];
+				max = sampleMs[0];
+				foreach (float f in sampleMs) { avg += f; if (f < min) min = f; if (f > max) max = f; }
+				avg /= sampleMs.Count;
+			}
+			int atoms = 0;
+			foreach (Atom a in SC.GetAtoms()) if (a != null) atoms++;
+			JSONClass r = new JSONClass();
+			r["durationMs"] = F(durationMs);
+			r["frames"] = JSONRaw.Num(frames);
+			r["avgFrameMs"] = F(avg);
+			r["minFrameMs"] = F(min);
+			r["maxFrameMs"] = F(max);
+			r["fpsEstimate"] = avg > 0f ? F(1000f / avg) : JSONRaw.Num(0f);
+			r["stallMs"] = F(stallTime);
+			r["atoms"] = JSONRaw.Num(atoms);
+			r["gcHeapBytes"] = JSONRaw.Num(GC.GetTotalMemory(false));
+			return r;
+		}
+
+		// ===================== person hand control =====================
+
+		public JSONNode PersonHandControl(JSONNode args) {
+			Atom p = RequirePerson(S(args, "person"));
+			string hand = S(args, "hand").ToLowerInvariant();
+			if (hand != "left" && hand != "right") throw new ApiError("hand required: left or right");
+			string ctrlId = (hand == "left" ? "lHandControl" : "rHandControl");
+			string la = S(args, "action").ToLowerInvariant();
+			if (la == "" ) throw new ApiError("action required: SetTarget, SetWeight, SetRotation, AutoGrasp, Release");
+			JSONClass r = new JSONClass();
+			r["uid"] = p.uid;
+			r["hand"] = hand;
+			string used;
+			JSONStorable st = ResolveStorable(p, ctrlId, hand == "left" ? "lhand" : "rhand", out used);
+			if (st == null) throw new ApiError("no " + ctrlId + " control on " + p.uid + "; storables: " + string.Join(", ", p.GetStorableIDs().ToArray()));
+			r["storable"] = used;
+			if (la == "settarget") {
+				string target = S(args, "target_uid");
+				// FreeControllerV3 look-at: try a look-at target chooser first
+				string lookParam = MatchChooserParam(st, "lookat");
+				if (lookParam != null) {
+					st.SetStringChooserParamValue(lookParam, target);
+					r["lookAt"] = st.GetStringChooserParamValue(lookParam);
+					return r;
+				}
+				throw new ApiError("no look-at target chooser on the hand control (available params visible via list_storable_params storable=" + used + "); position the hand with set_control instead");
+			}
+			if (la == "autograsp" || la == "release") {
+				string graspParam = MatchBoolParam(st, "grasp");
+				if (graspParam != null) { st.SetBoolParamValue(graspParam, la == "autograsp"); r["grasp"] = JSONRaw.Bool(st.GetBoolParamValue(graspParam)); return r; }
+				graspParam = MatchFloatParam(st, "grasp");
+				if (graspParam != null) { st.SetFloatParamValue(graspParam, la == "autograsp" ? Num(args, "value", 1f) : 0f); r["grasp"] = F(st.GetFloatParamValue(graspParam)); return r; }
+				throw new ApiError("no grasp param on the hand control; " + ActionHelp(st));
+			}
+			throw new ApiError("unknown hand action: " + S(args, "action") + "; weights/grasp live on the hands look plugin if present — see list_plugins");
+		}
+
+		// ===================== person material =====================
+
+		public JSONNode PersonMaterial(JSONNode args) {
+			Atom p = RequirePerson(S(args, "person"));
+			string material = S(args, "material");
+			if (material == "") throw new ApiError("material required (e.g. skin, genitals, eyes, mouth, nails)");
+			string matched = null;
+			foreach (string sid in p.GetStorableIDs()) {
+				if (string.Equals(sid, material, StringComparison.OrdinalIgnoreCase)) { matched = sid; break; }
+			}
+			if (matched == null) {
+				foreach (string sid in p.GetStorableIDs()) {
+					if (sid.IndexOf(material, StringComparison.OrdinalIgnoreCase) >= 0) { matched = sid; break; }
+				}
+			}
+			if (matched == null) throw new ApiError("no material storable matching \"" + material + "\" on " + p.uid + "; storables: " + string.Join(", ", p.GetStorableIDs().ToArray()));
+			string la = S(args, "action").ToLowerInvariant();
+			if (la == "" ) throw new ApiError("action required: ListParams, GetParam, SetParam");
+			if (la == "listparams") {
+				JSONClass r = new JSONClass();
+				r["uid"] = p.uid;
+				r["storable"] = matched;
+				r["params"] = ParamSnapshot(p.GetStorableByID(matched), 60, 40, 10, 8, 8);
+				return r;
+			}
+			JSONNode sub = new JSONClass();
+			sub["uid"] = p.uid;
+			sub["storable"] = matched;
+			sub["param"] = args["param"];
+			if (Has(args, "value")) sub["value"] = args["value"];
+			if (Has(args, "type")) sub["type"] = args["type"];
+			if (Has(args, "reload")) sub["reload"] = args["reload"];
+			return la == "getparam" ? GetParam(sub) : SetParam(sub);
 		}
 
 		// ===================== hub (community resources) =====================
