@@ -112,7 +112,7 @@ namespace VaMMCP.Mcp {
 
 			// ---------- clothing / hair ----------
 			tools.Add(new Tool("list_packages", "List installed .var packages (their asset paths are usable in load_clothing_preset / load_hair_preset / add_clothing_item / add_hair_item).")
-				.Fn(a => api.ListPackages()));
+				.Fn(a => api.ListPackages(a)));
 			tools.Add(new Tool("list_clothing_presets", "List clothing presets/items on disk AND inside all .var packages (path may be a package path like 'Package.1:/Custom/Clothing/...').")
 				.P("search", "string", "Optional substring filter", false)
 				.Fn(api.ListClothingPresets));

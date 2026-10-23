@@ -745,16 +745,22 @@ namespace VaMMCP.Api {
 			return list;
 		}
 
-		public JSONNode ListPackages() {
+		public JSONNode ListPackages(JSONNode args) {
+			string search = args != null && args["search"] != null ? args["search"].Value.ToLowerInvariant() : "";
 			List<string> pkgs = ListPackageUids();
 			JSONArray arr = new JSONArray();
+			int total = 0;
 			foreach (string p in pkgs) {
+				total++;
+				if (search != "" && p.ToLowerInvariant().IndexOf(search) < 0) continue;
 				JSONClass row = new JSONClass();
 				row["uid"] = p;
 				arr.Add(row);
+				if (arr.Count >= 400) break;
 			}
 			JSONClass r = new JSONClass();
 			r["count"] = JSONRaw.Num(arr.Count);
+			r["total"] = JSONRaw.Num(total);
 			r["packages"] = arr;
 			return r;
 		}
@@ -2390,22 +2396,21 @@ namespace VaMMCP.Api {
 			if (st != null) {
 				string transition = S(args, "transition_type");
 				if (transition != "") {
-					string p = MatchChooserParam(st, "transition");
-					if (p == null) p = MatchFloatParam(st, "transition");
+					string p = MatchChooserParam(st, "curvetype");
+					if (p == null) p = MatchChooserParam(st, "transition");
 					try {
-						if (p != null && MatchFloatParam(st, p) == null) {
+						if (p != null) {
 							st.SetStringChooserParamValue(p, transition);
 							applied[p] = transition;
-						} else if (p != null) {
-							st.SetFloatParamValue(p, NumArg(transition));
-							applied[p] = F(NumArg(transition));
 						} else applied["transitionType"] = "not found (check param names via list_storable_params)";
 					} catch (Exception e) {
 						applied["transitionType.error"] = e.Message;
 					}
 				}
 				if (Has(args, "duration")) {
-					string p = MatchFloatParam(st, "duration");
+					string p = MatchFloatParam(st, "transitiontot");
+					if (p == null) p = MatchFloatParam(st, "transition");
+					if (p == null) p = MatchFloatParam(st, "duration");
 					if (p == null) p = MatchFloatParam(st, "length");
 					if (p != null) {
 						st.SetFloatParamValue(p, Num(args, "duration", 1f));
@@ -2435,6 +2440,15 @@ namespace VaMMCP.Api {
 				}
 				if (link == null) {
 					if (st.GetActionNames().Contains("Link To Animation Pattern")) link = st.GetAction("Link To Animation Pattern");
+				}
+				// built-in AnimationPattern/AnimationStep: steps are parented under the pattern atom (ParentAllSteps)
+				if (link == null && patternUid != "") {
+					Atom pat2 = FindAtomQuiet(patternUid);
+					if (pat2 != null) {
+						string pu2;
+						JSONStorable pst2 = ResolveStorable(pat2, "AnimationPattern", "animation", out pu2);
+						if (pst2 != null && pst2.GetActionNames().Contains("ParentAllSteps")) link = pst2.GetAction("ParentAllSteps");
+					}
 				}
 				if (link != null && link.actionCallback != null) {
 					try { link.actionCallback(); applied["linked"] = link.name; } catch (Exception e) { applied["linked.error"] = e.Message; }
@@ -2542,21 +2556,29 @@ namespace VaMMCP.Api {
 		public JSONNode ListTriggers(JSONNode args) {
 			string search = S(args, "search").ToLowerInvariant();
 			JSONArray arr = new JSONArray();
+			List<Atom> atoms = new List<Atom>();
 			foreach (Atom a in SC.GetAtoms()) {
-				if (a == null) continue;
-				foreach (string sid in a.GetStorableIDs()) {
-					if (sid.IndexOf("trigger", StringComparison.OrdinalIgnoreCase) < 0) continue;
-					JSONStorable st = a.GetStorableByID(sid);
-					if (st == null) continue;
-					if (search != "" && a.uid.ToLowerInvariant().IndexOf(search) < 0 && sid.ToLowerInvariant().IndexOf(search) < 0) continue;
-					JSONClass row = new JSONClass();
-					row["uid"] = a.uid;
+				if (a != null) atoms.Add(a);
+			}
+			// two passes: exact "Trigger" storables first, then other trigger-named storables
+			for (int pass = 0; pass < 2; pass++) {
+				foreach (Atom a in atoms) {
+					foreach (string sid in a.GetStorableIDs()) {
+						bool exact = string.Equals(sid, "Trigger", StringComparison.OrdinalIgnoreCase);
+						if (pass == 0 ? !exact : exact) continue;
+						if (sid.IndexOf("trigger", StringComparison.OrdinalIgnoreCase) < 0) continue;
+						JSONStorable st = a.GetStorableByID(sid);
+						if (st == null) continue;
+						if (search != "" && a.uid.ToLowerInvariant().IndexOf(search) < 0 && sid.ToLowerInvariant().IndexOf(search) < 0) continue;
+						JSONClass row = new JSONClass();
+						row["uid"] = a.uid;
 					row["type"] = a.type;
 					row["storable"] = sid;
 					row["params"] = ParamSnapshot(st, 10, 8, 4, 6, 2);
 					row["actions"] = ActionHelp(st);
 					arr.Add(row);
 					break; // one trigger row per atom keeps listings small
+				}
 				}
 				if (arr.Count >= 80) break;
 			}
@@ -2571,18 +2593,38 @@ namespace VaMMCP.Api {
 			if (tuid == "") throw new ApiError("trigger_uid required (see list_triggers)");
 			Atom a;
 			string sid = S(args, "storable");
-			// accept "atom uid" or "atom/Trigger" combined
-			int slice = tuid.IndexOf('/');
-			if (slice >= 0 && ParamEmpty(sid)) {
-				sid = tuid.Substring(slice + 1);
-				tuid = tuid.Substring(0, slice);
+			// full atom uid first (uids can contain '/'), then fall back to "atom/Trigger" splitting
+			a = SC.GetAtomByUid(tuid);
+			if (a == null) {
+				int slice = tuid.IndexOf('/');
+				if (slice >= 0 && ParamEmpty(sid)) {
+					sid = tuid.Substring(slice + 1);
+					a = SC.GetAtomByUid(tuid.Substring(0, slice));
+				}
+				if (a == null) throw new ApiError("atom not found: " + tuid);
+				if (!ParamEmpty(sid) && a.GetStorableByID(sid) == null) sid = "";
 			}
-			a = FindAtom(tuid);
 			string la = S(args, "action").ToLowerInvariant();
 			if (la == "fire") la = "trigger";
 			if (la == "" ) throw new ApiError("action required: Fire, SetFloatParam, SetBoolParam, Reset or any action name");
-			string used;
-			JSONStorable st = ResolveStorable(a, sid, sid == "" ? "trigger" : null, out used);
+			string used = "";
+			JSONStorable st;
+			if (ParamEmpty(sid)) {
+				// default: exact "trigger" first, then a contains("trigger") scan among the rest
+				st = a.GetStorableByID("Trigger");
+				if (st == null) {
+					foreach (string id in a.GetStorableIDs()) {
+						if (string.Equals(id, "Trigger", StringComparison.OrdinalIgnoreCase)) {
+							JSONStorable t2 = a.GetStorableByID(id);
+							if (t2 != null) { st = t2; used = id; goto resolved; }
+						}
+					}
+				}
+				st = ResolveStorable(a, "", "trigger", out used);
+			} else {
+				st = ResolveStorable(a, sid, "trigger", out used);
+			}
+		resolved:
 			if (st == null) throw new ApiError("no trigger storable on " + a.uid + "; storables: " + string.Join(", ", a.GetStorableIDs().ToArray()));
 			JSONClass r = new JSONClass();
 			r["uid"] = a.uid;
@@ -3478,7 +3520,7 @@ namespace VaMMCP.Api {
 		public JSONNode PackageManager(JSONNode args) {
 			string action = S(args, "action").ToLowerInvariant();
 			if (action == "listenabled" || action == "list") {
-				return ListPackages();
+				return ListPackages(args);
 			}
 			if (action == "scanpackages" || action == "refreshpackages") {
 				Exception last = null;
@@ -3713,7 +3755,7 @@ namespace VaMMCP.Api {
 				if (nameF != "" && a.uid.IndexOf(nameF, StringComparison.OrdinalIgnoreCase) < 0
 					&& (a.name == null || a.name.IndexOf(nameF, StringComparison.OrdinalIgnoreCase) < 0)) continue;
 				if (typeF != "" && !string.Equals(a.type, typeF, StringComparison.OrdinalIgnoreCase)) continue;
-				bool keep = nameF == "" && typeF == "";
+				bool keep = nameF != "" || typeF != "";
 				if (compF != "") {
 					if (a.mainController == null) continue;
 					Component[] cs = a.mainController.GetComponentsInChildren<Component>(true);
@@ -3878,7 +3920,7 @@ namespace VaMMCP.Api {
 						row["param"] = n;
 						row["path"] = v;
 						string pak = v.IndexOf(":") >= 0 ? v.Substring(0, v.IndexOf(":")) : "";
-						bool missing = pak != "" && !installed.Contains(pak) && !System.IO.File.Exists(Application.dataPath + "/../" + v.Replace('/', System.IO.Path.DirectorySeparatorChar));
+						bool missing = pak != "" && !installed.Contains(pak) && !installed.Contains(pak + ".var") && !System.IO.File.Exists(Application.dataPath + "/../" + v.Replace('/', System.IO.Path.DirectorySeparatorChar));
 						row["missing"] = JSONRaw.Bool(missing);
 						rows.Add(row);
 						if (rows.Count >= 80) return FinishRefs(rows, seen);
