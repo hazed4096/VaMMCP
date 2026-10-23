@@ -214,6 +214,18 @@ namespace VaMMCP.Mcp {
 				.P("position", "array", "[x, y, z] world position", false)
 				.P("rotation", "array", "[x, y, z] euler angles", false)
 				.Fn(api.SetControl));
+			tools.Add(new Tool("set_control_state", "Set a control's positionState/rotationState (On/Off/Follow/Hold/Lock/ParentLink/PhysicsLink/Comply). State must be On to pose the control.")
+				.P("person", "string", "Person uid (default: first Person)", false)
+				.P("control", "string", "Control id from list_controls", true)
+				.P("positionState", "string", "On/Off/Follow/Hold/Lock/ParentLink/PhysicsLink/Comply", false)
+				.P("rotationState", "string", "On/Off/Follow/Hold/Lock/LookAt/ParentLink/PhysicsLink/Comply", false)
+				.Fn(api.SetControlState));
+			tools.Add(new Tool("control_pose", "Pose a control: sets positionState/rotationState to On, then sets position and rotation in one call.")
+				.P("person", "string", "Person uid (default: first Person)", false)
+				.P("control", "string", "Control id from list_controls", true)
+				.P("position", "array", "[x, y, z] world position", false)
+				.P("rotation", "array", "[x, y, z] euler angles", false)
+				.Fn(api.ControlPose));
 			tools.Add(new Tool("set_gaze", "Adjust a person's gaze via the lookAt storable (best effort; inspect with list_storable_params storable=lookAt for the full param list).")
 				.P("person", "string", "Person uid (default: first Person)", false)
 				.P("amount", "number", "gazeAmount 0..1 (optional)", false)

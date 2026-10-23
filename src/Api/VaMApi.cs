@@ -1585,6 +1585,54 @@ namespace VaMMCP.Api {
 			return r;
 		}
 
+		/// <summary>Set a control's positionState/rotationState chooser (On/Off/Follow/Hold/Lock/...).
+		/// State must be On for set_control / control_pose to take effect.</summary>
+		public JSONNode SetControlState(JSONNode args) {
+			Atom p = RequirePerson(S(args, "person"));
+			string controlId = S(args, "control");
+			if (controlId == "") throw new ApiError("control required (see list_controls)");
+			FreeControllerV3 fc = GetControl(p, controlId);
+			JSONClass r = new JSONClass();
+			r["person"] = p.uid;
+			r["control"] = controlId;
+			if (Has(args, "positionState")) {
+				fc.currentPositionState = (FreeControllerV3.PositionState)ParseEnum(typeof(FreeControllerV3.PositionState), S(args, "positionState"));
+				r["positionState"] = fc.currentPositionState.ToString();
+			}
+			if (Has(args, "rotationState")) {
+				fc.currentRotationState = (FreeControllerV3.RotationState)ParseEnum(typeof(FreeControllerV3.RotationState), S(args, "rotationState"));
+				r["rotationState"] = fc.currentRotationState.ToString();
+			}
+			return r;
+		}
+
+		/// <summary>Pose a control: sets positionState/rotationState to On, then sets position and rotation.</summary>
+		public JSONNode ControlPose(JSONNode args) {
+			Atom p = RequirePerson(S(args, "person"));
+			string controlId = S(args, "control");
+			if (controlId == "") throw new ApiError("control required (see list_controls)");
+			FreeControllerV3 fc = GetControl(p, controlId);
+			fc.currentPositionState = FreeControllerV3.PositionState.On;
+			fc.currentRotationState = FreeControllerV3.RotationState.On;
+			if (Has(args, "position")) fc.SetPositionNoForce(ParseVec3(args["position"]));
+			if (Has(args, "rotation")) fc.SetRotationNoForce(ParseVec3(args["rotation"]));
+			JSONClass r = new JSONClass();
+			r["person"] = p.uid;
+			r["control"] = controlId;
+			r["positionState"] = "On";
+			r["rotationState"] = "On";
+			r["position"] = Vec(fc.control.position);
+			r["rotation"] = Vec(fc.control.eulerAngles);
+			return r;
+		}
+
+		private static object ParseEnum(Type enumType, string name) {
+			foreach (string n in Enum.GetNames(enumType)) {
+				if (string.Equals(n, name, StringComparison.OrdinalIgnoreCase)) return Enum.Parse(enumType, n);
+			}
+			throw new ApiError("unknown " + enumType.Name + " value: " + name + " (valid: " + string.Join(", ", Enum.GetNames(enumType)) + ")");
+		}
+
 		public JSONNode SetGaze(JSONNode args) {
 			Atom p = RequirePerson(S(args, "person"));
 			JSONStorable lookAt = p.GetStorableByID("lookAt");
