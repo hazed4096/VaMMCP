@@ -570,6 +570,40 @@ namespace VaMMCP.Api {
 			return r;
 		}
 
+		/// <summary>List all objects (atoms) in the scene with uid, type, on/off, position, rotation,
+		/// scale and optional bounding box (min/max/center/size in world space from renderers).</summary>
+		public JSONNode ListObjects(JSONNode args) {
+			string type = S(args, "type");
+			bool doBbox = Bool(args, "bbox", true);
+			JSONArray arr = new JSONArray();
+			foreach (Atom a in SC.GetAtoms()) {
+				if (a == null) continue;
+				if (type != "" && !string.Equals(a.type, type, StringComparison.OrdinalIgnoreCase)) continue;
+				JSONClass row = AtomInfo(a);
+				if (doBbox) {
+					Renderer[] rs = a.GetComponentsInChildren<Renderer>(true);
+					if (rs != null && rs.Length > 0) {
+						Bounds b = rs[0].bounds;
+						for (int i = 1; i < rs.Length; i++) b.Encapsulate(rs[i].bounds);
+						row["bbox_min"] = Vec(b.min);
+						row["bbox_max"] = Vec(b.max);
+						row["bbox_center"] = Vec(b.center);
+						row["bbox_size"] = Vec(b.size);
+					} else {
+						row["bbox_min"] = JSONRaw.Null();
+						row["bbox_max"] = JSONRaw.Null();
+						row["bbox_center"] = JSONRaw.Null();
+						row["bbox_size"] = JSONRaw.Null();
+					}
+				}
+				arr.Add(row);
+			}
+			JSONClass r = new JSONClass();
+			r["count"] = JSONRaw.Num(arr.Count);
+			r["objects"] = arr;
+			return r;
+		}
+
 		/// <summary>Poller tool: starts AddAtomByType on the main thread, then polls for the new atom.</summary>
 		public JSONNode AddAtom(JSONNode args) {
 			string type = S(args, "type");

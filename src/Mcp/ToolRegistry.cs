@@ -42,6 +42,10 @@ namespace VaMMCP.Mcp {
 			tools.Add(new Tool("list_atoms", "List atoms in the current scene with uid, type, on/off, position, rotation.")
 				.P("type", "string", "Optional atom type filter, e.g. Person", false)
 				.Fn(api.ListAtoms));
+			tools.Add(new Tool("list_objects", "List all objects (atoms) in the scene with uid, type, on/off, position, rotation, scale and bounding box (min/max/center/size in world space from renderers).")
+				.P("type", "string", "Optional atom type filter, e.g. Person", false)
+				.P("bbox", "boolean", "Include bounding box calculation (default true)", false)
+				.Fn(api.ListObjects));
 			tools.Add(new Tool("add_atom", "Create an atom of the given type (Person, Light, AnimationPattern, ...). Waits until it exists.")
 				.P("type", "string", "Atom type (see list_atom_types)", true)
 				.P("uid", "string", "Optional uid; auto-generated when omitted", false)
