@@ -1246,8 +1246,62 @@ namespace VaMMCP.Api {
 			r["libraryBefore"] = JSONRaw.Num(libraryBefore);
 			r["libraryAfter"] = JSONRaw.Num(libraryAfter);
 			r["hint"] = "If nothing changed, VaM's runtime clothing creator is not initialised: "
-				+ "open " + p.uid + " > Clothing in VaM once, then retry. Paths must point at a .vam "
+				+ "run open_clothing_tab for " + p.uid + " first (this opens that person's "
+				+ "clothing creator runtime), then retry. Paths must point at a .vam "
 				+ "clothing item (see list_clothing_presets), not at a folder.";
+			return r;
+		}
+
+		/// <summary>Initialise a person's runtime clothing creator: the equivalent of
+		/// opening that person's Person > Clothing tab once in VaM. Activates the
+		/// creator item (JSONStorableDynamic.OnEnable -> OnLoadComplete -> ready = true)
+		/// and waits for the DAZRuntimeCreator component to appear. Must be re-run
+		/// after every scene load (session state). Without this, add_clothing_item is
+		/// a silent no-op.</summary>
+		public JSONNode OpenClothingTab(JSONNode args) {
+			Atom p = Mt.Run(() => RequirePerson(S(args, "person")), 15000);
+			int waitSeconds = Has(args, "wait_seconds") ? args["wait_seconds"].AsInt : 15;
+			if (waitSeconds < 1) waitSeconds = 1;
+			DAZCharacterSelector sel = Selector(p);
+			DAZClothingItem creator = sel.gender == DAZCharacterSelector.Gender.Male
+				? sel.maleClothingCreatorItem : sel.femaleClothingCreatorItem;
+			JSONClass r = new JSONClass();
+			r["person"] = p.uid;
+			r["gender"] = sel.gender.ToString();
+			if (creator == null) {
+				r["ok"] = JSONRaw.Bool(false);
+				r["reason"] = "no clothing creator item available on " + p.uid;
+				return r;
+			}
+			// Activate the creator item - opening Person > Clothing in VaM does exactly
+			// this, which runs JSONStorableDynamic.OnEnable -> OnLoadComplete and sets
+			// ready = true, building the DAZRuntimeCreator on the creator item.
+			Mt.Run(() => { try { sel.SetActiveClothingItem(creator, true); } catch (Exception e) { r["activate.error"] = e.Message; } }, 15000);
+			DateTime deadline = DateTime.UtcNow.AddSeconds(waitSeconds);
+			bool ready = false;
+			Component drc = null;
+			while (DateTime.UtcNow < deadline) {
+				try { ready = ((JSONStorableDynamic)creator).ready; } catch { ready = false; }
+				if (ready) {
+					drc = FindComponent(creator, "DAZRuntimeCreator");
+					if (drc != null) break;
+				}
+				Thread.Sleep(250);
+			}
+			r["ready"] = JSONRaw.Bool(ready);
+			r["hasRuntimeCreator"] = JSONRaw.Bool(drc != null);
+			if (!ready) {
+				r["ok"] = JSONRaw.Bool(false);
+				r["reason"] = "clothing creator did not become ready in time";
+				return r;
+			}
+			if (drc == null) {
+				r["ok"] = JSONRaw.Bool(false);
+				r["reason"] = "no DAZRuntimeCreator component on the clothing creator item";
+				return r;
+			}
+			r["ok"] = JSONRaw.Bool(true);
+			r["note"] = "clothing creator initialised; add_clothing_item will now work for " + p.uid;
 			return r;
 		}
 

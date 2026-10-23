@@ -130,6 +130,11 @@ namespace VaMMCP.Mcp {
 				.P("wait_seconds", "number", "How long to wait for the async load (default 20)", false)
 				.Timeout(60000).Poller()
 				.Fn(api.AddClothingItem));
+			tools.Add(new Tool("open_clothing_tab", "Initialise a person's runtime clothing creator (the equivalent of opening that person's Person > Clothing tab once in VaM). Without this, add_clothing_item silently no-ops because VaM never builds the DAZRuntimeCreator on the creator item. Must be re-run after every scene load.")
+				.P("person", "string", "Person uid (default: first Person)", false)
+				.P("wait_seconds", "number", "How long to wait for the creator to initialise (default 15)", false)
+				.Timeout(60000).Poller()
+				.Fn(api.OpenClothingTab));
 			tools.Add(new Tool("remove_clothing_item", "Remove a clothing item from a person.")
 				.P("id", "string", "Clothing item uid from list_clothing_items", true)
 				.P("person", "string", "Person uid (default: first Person)", false)
