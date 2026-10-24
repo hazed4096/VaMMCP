@@ -7,6 +7,37 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Local WAV decode + play via `audio_source_action`.** `SetClip` decodes
+  disk PCM WAVs (16-bit or float32) in-plugin (`FileManagerSecure.ReadAllBytes`
+  + `AudioClip.Create`/`SetData`) and caches them, because VaM's
+  `URLAudioClipManager` queue never advances in a fresh scene (its coroutine is
+  dormant until the Sound tab is touched, so queued ogg/mp3 stay `ready=false`
+  silently). `Play`/`PlayLoop` remember the last `SetClip` per atom; ogg/mp3
+  still route to `QueueClip` with a "may stall until Sound tab opened" note.
+  Verified: SetClip -> ready/Play/Pause/UnPause/Stop round trip on a test tone.
+- **`set_gaze` drives VaM's native `eyeTargetControl`.** A Person has no
+  `lookAt` storable (decompile: nothing named `lookAt` exists); native gaze is
+  the `eyeTargetControl` FreeControllerV3. `"Camera"`/an atom uid moves it and
+  forces position/rotation states On, `"None"` returns it to Off (pose-driven).
+- **`person_hand_control SetTarget/SetRotation`.** `SetTarget` now sets the
+  hand FreeControllerV3's transform `lookAt` to the target (or camera) and
+  switches its `rotationState` chooser to `LookAt`; `SetRotation` uses
+  `SetRotationNoForce`. A stock FreeControllerV3 has no IK-weight param, so
+  `SetWeight`/`AutoGrasp` error with that explanation instead of a mystery.
+- **`person_animation` touches every animation storable** (32 on a fresh
+  Person: `abdomen2Animation`, `chestAnimation`, ...), not just the first
+  (previously only `abdomen2Animation`). Playback/arm/stop report `touched` and
+  `called` per action; per-storable failures are skipped, not fatal.
+- **`trigger_action Fire` really fires.** VaM's button handler fires by
+  pulsing the `Trigger` object's `active` flag; the tool now does the same for
+  `UIButtonTrigger` (and `VariableTrigger`), which works even with no receiver
+  actions configured. Also fixed trigger resolution: the exact-id `Trigger`
+  result was being unconditionally overwritten by a fuzzy `contains("trigger")`
+  pick, so `Fire` errored or hit the wrong storable.
+- **`add_atom` poller waits by uid with a 90 s deadline** (was type-match +
+  45 s): a cold-boot Person can take longer than the old deadline to stream in,
+  and the atom then appeared *after* the timeout - with the uid poll the tool
+  either returns the real created atom or admits it may still be streaming.
 - **Keep-alive for an unfocused, maximised VaM window on a second virtual
   desktop.** Exclusive fullscreen pauses Unity's player loop on focus loss
   (verified: no `Update()` ticks while unfocused), which stopped every
@@ -30,6 +61,42 @@ All notable changes to this project are documented here. The format follows
   `set_param`
 
 ### Fixed
+- **A nondeterministic "blurry screen + upside-down triangle + dead camera" was
+  a real (OS-level) minimised VaM.** `GetWindowPlacement` showed `showCmd: 2`
+  (SW_SHOWMINIMIZED); IdleSaver's `(minimized)` status string was the giveaway.
+  The white triangle is the empty Unity render of the minimised window. Restoring
+  the window and focusing VaM brings input back.
+- **`capture_view` camera mode could crash VaM natively.** It created the
+  `RenderTexture` and ran `cam.Render()`/`ReadPixels` on the HTTP worker
+  thread; RenderTexture construction from a non-main thread aborts the player
+  (crash stack: `RenderTexture:.ctor` under `CaptureViewCamera`). All camera
+  work now runs inside one `Mt.Run` block.
+- **`atom_control Select` now selects for real.** VaM's selection entry point
+  is `SelectController(FreeControllerV3)` on SuperController - the previously
+  probed `SelectAtom`/`SetSelectedAtom` names do not exist. Likewise `EndIsolate`
+  maps to `SuperController.EndIsolateEditAtom()`; `IsolateEdit` errors with an
+  explanation (entering isolation is an editor-UI action).
+- **`set_param` falls back to float for numeric values it cannot classify**,
+  and its error names the storable and points at `list_storable_params`
+  (previously "cannot determine param type" told no more).
+- **`animation_step_action SetTransition` accepts a numeric value as
+  `transitionToTime`** (VaM's AnimationStep stores the transition length as
+  JSONStorableFloat `transitionToTime`; the old code only matched a
+  transition-type chooser and errored otherwise). String values still try the
+  choosers.
+- **Five broken em-dashes (`ΓÇö` mojibake) removed from tool help/results**;
+  the bytes broke cp1252 console clients mid-JSON (scripts with
+  `errors='strict'` printing crashed on tool output).
+- **`atom_control FreezePhysics` semantic fix**: `value=false` now unfreezes
+  (symmetric with `UnfreezePhysics`).
+- **`physics_object_action` fixed: it hit the wrong component.** The old
+  storable-search path landed on `CollisionTrigger` first ("no such param on
+  CollisionTrigger"). `SetMass`/`SetDrag`/`AddForce` now operate on a Unity
+  Rigidbody attached to the atom's mainController GameObject (auto-added when
+  missing; ForceMode.VelocityChange; `AddForce` returns the resulting velocity).
+  `FreezePhysics` also honours `value=false` as unfreeze.
+- **`list_audio_sources` reports `playingClip`/`playingClipReady`** so a
+  playback can be checked without a separate get_param.
 - **`add_hair_item` now works.** It used to drive the runtime hair *creator*
   (`HairCreator` -> `DAZRuntimeCreator.LoadFromPath`), which silently loaded
   nothing (that flow is the hair AUTHOR editor; the creator item's `ready` never

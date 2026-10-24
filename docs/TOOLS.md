@@ -29,7 +29,7 @@ VaM runtime status: plugin version, VaM version, atom/person counts, endpoint, e
 | --- | --- | --- |
 | `list_atom_types` | — | Creatable atom types, grouped by category (from VaM's runtime data) |
 | `list_atoms` | `type?` | Atoms in the scene (uid/type/on/position/rotation) |
-| `add_atom` | `type`*, `uid?` | Create an atom and wait until it is ready (up to 45 s) |
+| `add_atom` | `type`*, `uid?` | Create an atom and wait until it is ready (up to 90 s; polls by uid) |
 | `remove_atom` | `uid`* | Delete an atom |
 | `set_atom_on` | `uid`*, `on`* | Show/hide |
 | `get_atom_transform` | `uid`* | World position / euler angles / scale |
@@ -93,7 +93,8 @@ VaM runtime status: plugin version, VaM version, atom/person counts, endpoint, e
 | `list_controls` | `person?` | FreeControllerV3 control points (headControl / chestControl / …) |
 | `get_control` | `person?`, `control`* | Control point world position / euler angles |
 | `set_control` | `person?`, `control`*, `position?`, `rotation?` | Move / rotate a control point |
-| `set_gaze` | `person?`, `amount?`, `targetControl?` | Gaze (best effort; for precise control use the `lookAt` storable parameters) |
+| `set_gaze` | `person?`, `targetControl?` | Drive the native `eyeTargetControl`: `"Camera"`/atom uid = look at it (position/rotation states forced On), `"None"` = Off (pose-driven). There is no `lookAt` storable on a Person |
+| `person_hand_control` | `person?`, `hand?` (left/right), `action`*, `target_uid?`/`value?` | Hand control point: `SetTarget` (atom uid or `"Camera"`) sets the hand control's transform `lookAt` + switches its rotationState chooser to `LookAt`; `SetRotation` (euler array) uses `SetRotationNoForce`; `Release` returns rotationState to Off. A stock FreeControllerV3 has no IK-weight param, so `SetWeight`/`AutoGrasp` error with that explanation |
 
 ## Generic parameters (the long tail)
 
@@ -102,7 +103,7 @@ VaM runtime status: plugin version, VaM version, atom/person counts, endpoint, e
 | `list_atom_storables` | `uid`* | Every storable on an atom, with its type |
  | `list_storable_params` | `uid`*, `storable`* | Parameter introspection: floats (with min/max/default) / bools / strings / urls / choosers / colors / actions / customParams / properties |
 | `get_param` | `uid`*, `storable`*, `param`* | Read one value (float/bool/string/url/chooser/color, falls back to public properties) |
-| `set_param` | `uid`*, `storable`*, `param`*, `value`*, `type?`, `reload?` | Write a parameter (colors accept `#RRGGBB` or `r,g,b,a`; url params set file/image urls and reload them unless `reload=false`) |
+| `set_param` | `uid`*, `storable`*, `param`*, `value`*, `type?`, `reload?` | Write a parameter (colors accept `#RRGGBB` or `r,g,b,a`; url params set file/image urls and reload them unless `reload=false`; unknown param + numeric value falls back to float, otherwise a clear error) |
 | `call_action` | `uid`*, `storable`*, `action`* | Trigger a storable action (a button in the UI) |
 
 `type` can force the interpretation: `float|bool|string|url|chooser|color|property`
@@ -114,7 +115,7 @@ VaM runtime status: plugin version, VaM version, atom/person counts, endpoint, e
 | --- | --- | --- |
 | `get_camera` | — | Monitor camera position / rotation / FOV |
 | `set_camera` | `position?`, `rotation?`, `fov?` | Move the camera |
-| `capture_view` | `width?`, `height?`, `path?`, `return_image?` | Render a screenshot (default `Saves/PluginData/vam-mcp/preview.png`). With `return_image=true` the PNG also comes back as an MCP image block, so clients that cannot read the VaM folder can still see it — keep the resolution modest (e.g. 640×360); anything above 4 MB stays on disk only |
+| `capture_view` | `width?`, `height?`, `path?`, `return_image?`, `mode?`, `timeout_ms?` | Screenshot (default `Saves/PluginData/vam-mcp/preview.png`). `mode=window` (default) grabs the real back buffer so person skin/clothing render correctly (polls until the next frame; TailSaver-style idle can make it slow). `mode=camera` does the fast RenderTexture re-render of the monitor camera, but person meshes may come out black in it. With `return_image=true` the PNG also comes back as an MCP image block — keep the resolution modest (e.g. 640×360); anything above 4 MB stays on disk only. Note: applying skin/clothing colours is still verified best in the VaM window, captures are indicative |
 
 ## Simulation
 
@@ -122,6 +123,30 @@ VaM runtime status: plugin version, VaM version, atom/person counts, endpoint, e
 | --- | --- | --- |
 | `set_simulation` | `paused?`, `timeScale?` | Pause / resume / time scale |
 | `reset_simulation` | — | Reset the physics simulation (settles soft-body and cloth jitter) |
+
+## Triggers / animation / audio / physics objects
+
+| Tool | Arguments | Notes |
+| --- | --- | --- |
+| `create_trigger` / `list_triggers` | `create_trigger`: `type?` (default UIButton), `uid?` | VaM trigger atoms; the created atom's `Trigger` storable is the target (see `trigger_action`) |
+| `trigger_action` | `trigger_uid`*, `action`*, `storable?`, `param?`, `value?` | `Fire` pulses the trigger exactly like VaM's button handler does (`trigger.active` true→false on `UIButtonTrigger`/`VariableTrigger`; works even with no receiver actions configured). `SetFloatParam`/`SetBoolParam` write `param`; any other name calls that action. Resolves `atom/Trigger` uids; default storable is the exact-id `Trigger` |
+| `create_animation_pattern` / `list_animation_patterns` | `uid?` / `search?` | AnimationPattern atoms (+ their step children, subject to VaM's auto-linking) |
+| `create_animation_step` | `pattern_uid`*, `uid?`, `duration?` | AnimationStep with `transitionToTime`; linkage to the pattern happens in the VaM UI when no auto-link action exists |
+| `list_animation_steps` | `pattern_uid`? | Steps of a pattern (some steps report no linkage param — see note in response) |
+| `animation_pattern_action` / `animation_step_action` | `pattern_uid`/`step_uid`*, `action`*, `value?` | Play/Stop/… actions; `Step SetTransition` takes seconds → `transitionToTime` (numeric) or a transition-type chooser word |
+| `record_scene_animation` | `pattern_uid`*, `action`* (start/stop) | Errors helpfully: VaM's built-in controller recording is UI-only (no Record action on the pattern) |
+| `create_audio_source` / `list_audio_sources` / `audio_source_action` | `audio_source_action`: `uid`*, `action`*, `clip?`/`value?` | Actions: SetClip, Play, PlayLoop, Pause, UnPause, Stop, SetVolume, SetLoop, … . `SetClip` decodes local PCM WAVs in-plugin (16-bit/float32); ogg/mp3 fall back to VaM's URL clip queue, which may stay `ready=false` until the Sound tab is opened. `Play`/`PlayLoop` reuse the last `SetClip`; `list_audio_sources` shows `playingClip` |
+| `physics_object_action` | `uid`*, `action`*, `value`/`direction?` | Rigidbody on the atom's mainController GameObject (auto-added when missing): `SetMass`, `SetDrag`, `AddForce` (impulse magnitude, default +Y; the sim must be awake — IdleSaver freezing stops motion) |
+
+## Atom UI helpers
+
+| Tool | Arguments | Notes |
+| --- | --- | --- |
+| `atom_control` | `uid`*, `action`*, `value?` | `Select` (SuperController.SelectController on the main controller), `FreezePhysics`/`UnfreezePhysics` (controller Position/Rotation state Freeze↔Off; `value=false` on FreezePhysics unfreezes), `DisableCollision`/`EnableCollision`, `DisableRender`/`EnableRender` (mapped to the atom power toggle), `EndIsolate` (EndIsolateEditAtom; entering isolation is UI-only) |
+| `atom_move` | `uid`*, `action`*, `value?` | SetPosition/SetRotation/SetScale/SnapToGround/AlignTo/ResetTransform |
+| `atom_geometry_choices` | `uid`*, `action`, `choice?` | Atom geometry choices on atoms that have them (CustomUnityAsset) |
+| `storable_diff` | `uid_a`*, `storable_a`*, `uid_b`*, `storable_b`* | Diff two storables (sameness counts + changed params) |
+
 
 ## Hub (community content)
 

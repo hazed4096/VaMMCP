@@ -28,7 +28,7 @@ VaM 运行时状态：插件版本、VaM 版本、原子/人物数量、端点�
 | --- | --- | --- |
 | `list_atom_types` | — | 可创建的原子类型（按分类，来自 VaM 运行时数据） |
 | `list_atoms` | `type?` | 场景原子列表（uid/type/on/位置/旋转） |
-| `add_atom` | `type`*, `uid?` | 创建原子，等待其就绪（最长 45s） |
+| `add_atom` | `type`*, `uid?` | 创建原子，等待其就绪（最长 90s，按 uid 轮询） |
 | `remove_atom` | `uid`* | 删除原子 |
 | `set_atom_on` | `uid`*, `on`* | 显示/隐藏 |
 | `get_atom_transform` | `uid`* | 世界坐标/欧拉角/缩放 |
@@ -92,7 +92,7 @@ VaM 运行时状态：插件版本、VaM 版本、原子/人物数量、端点�
 | `list_controls` | `person?` | FreeControllerV3 控制点（headControl / chestControl / …） |
 | `get_control` | `person?`, `control`* | 控制点世界位置/欧拉角 |
 | `set_control` | `person?`, `control`*, `position?`, `rotation?` | 移动/旋转控制点 |
-| `set_gaze` | `person?`, `amount?`, `targetControl?` | 视线（尽力而为；精确控制见 lookAt storable 参数） |
+| `set_gaze` | `person?`, `targetControl?` | 驱动原生 `eyeTargetControl`：`"Camera"`/原子 uid = 看向它（强制位置/旋转状态 On），`"None"` = Off（回到姿态驱动）。Person 上没有 `lookAt` storable |
 
 ## 通用参数（长尾全覆盖）
 
@@ -101,7 +101,7 @@ VaM 运行时状态：插件版本、VaM 版本、原子/人物数量、端点�
 | `list_atom_storables` | `uid`* | 原子全部 storable（含类型） |
 | `list_storable_params` | `uid`*, `storable`* | 参数内省：floats（含 min/max/default）/bools/strings/urls/choosers/colors/actions/customParams/properties |
 | `get_param` | `uid`*, `storable`*, `param`* | 读参数（float/bool/string/url/chooser/color/property 自动识别） |
-| `set_param` | `uid`*, `storable`*, `param`*, `value`*, `type?`, `reload?` | 写参数（颜色支持 `#RRGGBB` 或 `r,g,b,a`；url 参数设置文件/图片路径并默认重新加载，传 `reload=false` 跳过） |
+| `set_param` | `uid`*, `storable`*, `param`*, `value`*, `type?`, `reload?` | 写参数（颜色支持 `#RRGGBB` 或 `r,g,b,a`；url 参数设置文件/图片路径并默认重新加载，传 `reload=false` 跳过；未知参数+数值按 float 兜底，否则报清晰错误） |
 | `call_action` | `uid`*, `storable`*, `action`* | 触发 storable 的动作（按钮） |
 
 `type` 可强制指定：`float|bool|string|url|chooser|color|property`（`property` 走反射读写公共属性，覆盖 customParamNames 如 `gravityX`）。
@@ -120,6 +120,29 @@ VaM 运行时状态：插件版本、VaM 版本、原子/人物数量、端点�
 | --- | --- | --- |
 | `set_simulation` | `paused?`, `timeScale?` | 暂停/恢复/时间缩放 |
 | `reset_simulation` | — | 重置物理模拟（软体/布料抖动） |
+
+## 触发器 / 动画 / 音频 / 物理对象
+
+| 工具 | 参数 | 说明 |
+| --- | --- | --- |
+| `create_trigger` / `list_triggers` | `create_trigger`: `type?`（默认 UIButton）, `uid?` | VaM 触发原子；控其 `Trigger` storable（见 `trigger_action`） |
+| `trigger_action` | `trigger_uid`*, `action`*, `storable?`, `param?`, `value?` | `Fire` 与 VaM 按钮处理器完全一致地触发（对 `UIButtonTrigger`/`VariableTrigger` 脉冲 `trigger.active` true→false；没有配置接收动作也不报错）。`SetFloatParam`/`SetBoolParam` 写 `param`；其他名字按动作调用。支持 `原子/Trigger` uid；默认精确匹配 `Trigger` |
+| `create_animation_pattern` / `list_animation_patterns` | `uid?` / `search?` | AnimationPattern 原子（含其步骤，依赖 VaM 自动链接） |
+| `create_animation_step` | `pattern_uid`*, `uid?`, `duration?` | AnimationStep（`transitionToTime`）；无自动链接动作时需在 VaM UI 里挂接 |
+| `list_animation_steps` | `pattern_uid`? | 某模式的步骤（部分步骤不暴露链接参数，见返回提示） |
+| `animation_pattern_action` / `animation_step_action` | `pattern_uid`/`step_uid`*, `action`*, `value?` | Play/Stop/… 动作；`Step SetTransition` 数值=秒（写 `transitionToTime`），字符串=过渡类型选择 |
+| `record_scene_animation` | `pattern_uid`*, `action`* (start/stop) | 会给出解释错误：VaM 自带控制器录制仅 UI 可用（pattern 无 Record 动作） |
+| `create_audio_source` / `list_audio_sources` / `audio_source_action` | `audio_source_action`: `uid`*, `action`*, `clip?`/`value?` | 动作：SetClip, Play, PlayLoop, Pause, UnPause, Stop, SetVolume, SetLoop 等。`SetClip` 插件内直接解码本地 PCM WAV（16bit/float32）；ogg/mp3 走 VaM URL 队列，Sound 页签未打开前可能一直 `ready=false`。`Play`/`PlayLoop` 复用上次 `SetClip`；`list_audio_sources` 显示 `playingClip` |
+| `physics_object_action` | `uid`*, `action`*, `value`/`direction?` | mainController GameObject 上的 Rigidbody（缺失会自动加）：`SetMass`、`SetDrag`、`AddForce`（冲量幅值，默认 +Y；模拟必须醒着——IdleSaver 冻结时不动） |
+
+## 原子 UI 辅助
+
+| 工具 | 参数 | 说明 |
+| --- | --- | --- |
+| `atom_control` | `uid`*, `action`*, `value?` | `Select`（SuperController.SelectController 选主控制器）、`FreezePhysics`/`UnfreezePhysics`（控制器位置/旋转状态 Freeze↔Off；`value=false` 解冻）、`DisableCollision`/`EnableCollision`、`DisableRender`/`EnableRender`（映射到原子电源开关）、`EndIsolate`（EndIsolateEditAtom；进入隔离仅 UI） |
+| `atom_move` | `uid`*, `action`*, `value?` | SetPosition/SetRotation/SetScale/SnapToGround/AlignTo/ResetTransform |
+| `atom_geometry_choices` | `uid`*, `action`, `choice?` | 原子几何选项（CustomUnityAsset 等） |
+| `storable_diff` | `uid_a`*, `storable_a`*, `uid_b`*, `storable_b`* | 两个 storable 求差（相同/不同数 + 变化参数） |
 
 ## Hub 社区资源
 

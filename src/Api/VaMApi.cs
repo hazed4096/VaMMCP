@@ -629,10 +629,17 @@ namespace VaMMCP.Api {
 			}, 15000);
 
 			string created = null;
-			DateTime deadline = DateTime.UtcNow.AddSeconds(45);
+			DateTime deadline = DateTime.UtcNow.AddSeconds(90);
 			while (DateTime.UtcNow < deadline) {
 				Thread.Sleep(150);
 				created = Mt.Run(delegate {
+					// If we asked for a specific uid, match on it - the atom may appear
+					// with that exact uid even while its .type is still resolving (or
+					// character streaming keeps it "not ready" for a while).
+					if (uid != "") {
+						Atom byUid = SC.GetAtomByUid(uid);
+						if (byUid != null) return byUid.uid;
+					}
 					foreach (Atom a in SC.GetAtoms()) {
 						if (a == null) continue;
 						if (a.type == type && !before.Contains(a.uid)) return a.uid;
@@ -641,7 +648,10 @@ namespace VaMMCP.Api {
 				}, 10000);
 				if (created != null) break;
 			}
-			if (created == null) throw new ApiError("atom creation timed out for type " + type + " (check list_atom_types for valid types)");
+			if (created == null) {
+				string note = "(atom may still appear later; re-check with list_atoms)";
+				throw new ApiError("atom creation timed out for type " + type + " " + note + " (check list_atom_types for valid types)");
+			}
 
 			JSONClass r = new JSONClass();
 			r["uid"] = created;
@@ -1717,30 +1727,42 @@ namespace VaMMCP.Api {
 			throw new ApiError("unknown " + enumType.Name + " value: " + name + " (valid: " + string.Join(", ", Enum.GetNames(enumType)) + ")");
 		}
 
+		/// <summary>Aim a person's gaze by driving the native eyeTargetControl (position On) at the camera or an atom.
+		/// target:"None" returns the eye target to Off (pose-driven rest). "amount" is ignored by VaM natively.</summary>
 		public JSONNode SetGaze(JSONNode args) {
 			Atom p = RequirePerson(S(args, "person"));
-			JSONStorable lookAt = p.GetStorableByID("lookAt");
-			if (lookAt == null) throw new ApiError("no lookAt storable on " + p.uid);
+			FreeControllerV3 eye = GetControl(p, "eyeTargetControl");
 			JSONClass applied = new JSONClass();
 			float amount = Num(args, "amount", -1f);
+			if (amount >= 0f && amount < 1f) applied["breathAmountNote"] = "VaM eyes follow the eye target fully; amount<1 is ignored";
 			string targetControl = S(args, "targetControl");
-			if (amount >= 0f) {
-				if (lookAt.GetFloatParamNames().Contains("gazeAmount")) {
-					lookAt.SetFloatParamValue("gazeAmount", amount);
-					applied["gazeAmount"] = F(amount);
-				}
+			if (targetControl == "") {
+				throw new ApiError("targetControl required: 'Camera', an atom uid, or 'None' to release gaze");
 			}
-			if (targetControl != "") {
-				if (lookAt.GetStringChooserParamNames().Contains("target")) {
-					lookAt.SetStringChooserParamValue("target", targetControl);
-					applied["target"] = targetControl;
-				} else if (lookAt.GetStringParamNames().Contains("target")) {
-					lookAt.SetStringParamValue("target", targetControl);
-					applied["target"] = targetControl;
+			if (targetControl.ToLowerInvariant() == "none") {
+				Mt.Run(delegate { eye.currentPositionState = FreeControllerV3.PositionState.Off; }, 10000);
+				applied["eyeTarget"] = "Off (pose-driven)";
+			} else {
+				Vector3 pos = Vector3.zero;
+				bool got = false;
+				if (targetControl.ToLowerInvariant() == "camera") {
+					Mt.Run(delegate {
+						if (Camera.main != null) { pos = Camera.main.transform.position; got = true; }
+					}, 10000);
+					if (!got) throw new ApiError("no Camera.main found this frame; aim at an atom instead");
+				} else {
+					Atom t = FindAtom(targetControl);
+					Mt.Run(delegate {
+						if (t.mainController != null) { pos = t.mainController.transform.position; got = true; }
+						else if (t.transform != null) { pos = t.transform.position; got = true; }
+					}, 10000);
 				}
-			}
-			if (applied.Count == 0) {
-				throw new ApiError("lookAt storable has no controllable gaze params; use list_storable_params with storable=lookAt to see what it offers");
+				Vector3 finalPos = pos;
+				Mt.Run(delegate {
+					eye.currentPositionState = FreeControllerV3.PositionState.On;
+					eye.SetPositionNoForce(finalPos);
+				}, 10000);
+				applied["eyeTarget"] = Vec(finalPos);
 			}
 			JSONClass r = new JSONClass();
 			r["person"] = p.uid;
@@ -2176,8 +2198,18 @@ namespace VaMMCP.Api {
 					r["value"] = SerializePropValue(GetMemberValue(m, st));
 					break;
 				}
-				default:
-					throw new ApiError("cannot determine param type for " + name + "; specify type: float|bool|string|url|chooser|color|property");
+				default: {
+					// fall back: an explicit bogus type or an unknown param still gets a
+					// chance as float when the value parses numerically, then a clear error.
+					float fv;
+					if (float.TryParse(value.Value, out fv)) {
+						st.SetFloatParamValue(name, fv);
+						r["type"] = "float";
+						r["value"] = F(st.GetFloatParamValue(name));
+						break;
+					}
+					throw new ApiError("cannot determine param type for " + name + " (not a registered param on " + sid + " - check list_storable_params); specify type: float|bool|string|url|chooser|color|property");
+				}
 			}
 			return r;
 		}
@@ -2312,7 +2344,6 @@ namespace VaMMCP.Api {
 		}
 
 		public JSONNode CaptureViewCamera(JSONNode args) {
-			Camera cam = MonitorCamera();
 			int w = (int)Num(args, "width", 1280);
 			int h = (int)Num(args, "height", 720);
 			if (w < 64 || h < 64) throw new ApiError("width/height too small");
@@ -2322,29 +2353,39 @@ namespace VaMMCP.Api {
 			if (path == "") path = "Saves/PluginData/vam-mcp/preview.png";
 			FileManagerSecure.CreateDirectory("Saves/PluginData/vam-mcp");
 
-			RenderTexture rt = new RenderTexture(w, h, 24);
-			RenderTexture oldTarget = cam.targetTexture;
-			RenderTexture oldActive = RenderTexture.active;
-			Texture2D tex = null;
+			// All camera/RenderTexture work must run on the main thread - creating a
+			// RenderTexture from the HTTP worker thread crashes Unity natively.
+			byte[] bytes = null;
+			string captureError = null;
+			Mt.Run(delegate {
+				Camera cam = MonitorCamera();
+				if (cam == null) { captureError = "no monitor camera found"; return; }
+				RenderTexture rt = new RenderTexture(w, h, 24);
+				RenderTexture oldTarget = cam.targetTexture;
+				RenderTexture oldActive = RenderTexture.active;
+				Texture2D tex = null;
+				try {
+					cam.targetTexture = rt;
+					cam.Render();
+					RenderTexture.active = rt;
+					tex = new Texture2D(w, h, TextureFormat.RGB24, false);
+					tex.ReadPixels(new Rect(0, 0, w, h), 0, 0);
+					tex.Apply();
+					bytes = tex.EncodeToPNG();
+				} catch (Exception e) {
+					captureError = e.Message;
+				} finally {
+					cam.targetTexture = oldTarget;
+					RenderTexture.active = oldActive;
+					if (tex != null) UnityEngine.Object.Destroy(tex);
+					rt.Release();
+				}
+			}, 30000);
+			if (bytes == null) throw new ApiError(captureError != null ? captureError : "camera capture produced no frame");
+			int pngBytes = bytes.Length;
+			FileManagerSecure.WriteAllBytes(path, bytes);
 			string base64 = null;
-			int pngBytes = 0;
-			try {
-				cam.targetTexture = rt;
-				cam.Render();
-				RenderTexture.active = rt;
-				tex = new Texture2D(w, h, TextureFormat.RGB24, false);
-				tex.ReadPixels(new Rect(0, 0, w, h), 0, 0);
-				tex.Apply();
-				byte[] bytes = tex.EncodeToPNG();
-				pngBytes = bytes.Length;
-				FileManagerSecure.WriteAllBytes(path, bytes);
-				if (returnImage && bytes.Length <= MaxInlineImageBytes) base64 = Convert.ToBase64String(bytes);
-			} finally {
-				cam.targetTexture = oldTarget;
-				RenderTexture.active = oldActive;
-				if (tex != null) UnityEngine.Object.Destroy(tex);
-				rt.Release();
-			}
+			if (returnImage && bytes.Length <= MaxInlineImageBytes) base64 = Convert.ToBase64String(bytes);
 			JSONClass r = new JSONClass();
 			r["mode"] = "camera";
 			r["path"] = path;
@@ -2727,10 +2768,30 @@ namespace VaMMCP.Api {
 			string la = action.ToLowerInvariant();
 			if (la == "settransition") {
 				string want = S(args, "value");
-				string p = MatchChooserParam(st, "transition");
-				if (p == null) throw new ApiError("no transition param; " + ActionHelp(st));
-				st.SetStringChooserParamValue(p, want);
-				r["transition"] = st.GetStringChooserParamValue(p);
+				// "transitionToTime" (float, how long the transition into the NEXT step
+				// takes in seconds) is the programmable part of an AnimationStep;
+				// transition type lives on a chooser if exposed.
+				string p;
+				if (want != "") {
+					float fv;
+					if (float.TryParse(want, out fv)) {
+						p = MatchFloatParam(st, "transition");
+						if (p == null) p = MatchFloatParam(st, "transitionToTime");
+						if (p == null) throw new ApiError("no transition float param (expected 'transitionToTime'); " + ActionHelp(st));
+						st.SetFloatParamValue(p, fv);
+						r["transitionToTime"] = F(st.GetFloatParamValue(p));
+						return r;
+					}
+					p = MatchChooserParam(st, "transition");
+					if (p == null) p = MatchChooserParam(st, "transitionType");
+					if (p == null) throw new ApiError("no transition chooser param; set transitionToTime with a numeric value instead; " + ActionHelp(st));
+					st.SetStringChooserParamValue(p, want);
+					r["transition"] = st.GetStringChooserParamValue(p);
+					return r;
+				}
+				p = MatchFloatParam(st, "transition");
+				if (p == null) throw new ApiError("value required: seconds for transitionToTime, or a chooser word for the transition type; " + ActionHelp(st));
+				r["transitionToTime"] = F(st.GetFloatParamValue(p));
 				return r;
 			}
 			if (la == "setduration") {
@@ -2840,7 +2901,8 @@ namespace VaMMCP.Api {
 						}
 					}
 				}
-				st = ResolveStorable(a, "", "trigger", out used);
+				if (st == null) st = ResolveStorable(a, "", "trigger", out used);
+				else used = "Trigger";
 			} else {
 				st = ResolveStorable(a, sid, "trigger", out used);
 			}
@@ -2862,6 +2924,26 @@ namespace VaMMCP.Api {
 				r["param"] = p;
 				r["value"] = JSONRaw.Bool(st.GetBoolParamValue(p));
 				return r;
+			}
+			if (la == "trigger") {
+				// VaM has no "Fire" action; UIButtonTrigger fires by pulsing its Trigger
+				// object's active flag exactly like the button click handler does
+				// (OnButtonClick sets active true then false). Works even with no
+				// receiver actions configured (no-op there).
+				Trigger fired = null;
+				UIButtonTrigger uibt = st as UIButtonTrigger;
+				if (uibt != null) fired = uibt.trigger;
+				if (fired == null) {
+					VariableTrigger vt = st as VariableTrigger;
+					if (vt != null) fired = vt.trigger;
+				}
+				if (fired != null) {
+					fired.active = true;
+					fired.active = false;
+					r["called"] = used + " trigger.active pulse";
+					return r;
+				}
+				// otherwise fall through to the generic action lookup below with a clearer hint
 			}
 			JSONStorableAction act = FindActionCI(st, la);
 			if (act == null) throw new ApiError("action not found: " + S(args, "action") + "; " + ActionHelp(st));
@@ -2916,7 +2998,7 @@ namespace VaMMCP.Api {
 					}
 				}
 			}
-			throw new ApiError("no matching action for " + S(args, "action") + "; " + ActionHelp(st) + "; VaM opens trigger UIs by double-clicking the atom in the scene panel ΓÇö automate that with press_key/tab keys if needed");
+			throw new ApiError("no matching action for " + S(args, "action") + "; " + ActionHelp(st) + "; VaM opens trigger UIs by double-clicking the atom in the scene panel - automate that with press_key/tab keys if needed");
 		}
 
 		// ===================== physics =====================
@@ -2990,7 +3072,44 @@ namespace VaMMCP.Api {
 				r["touched"] = JSONRaw.Num(touched);
 				return r;
 			}
-			// single-storable operations for the first physicsy storable we find
+			// setmass / setdrag / addforce operate on a Unity Rigidbody: atoms rarely expose mass,
+			// drag or force as JSONStorable floats (a plain Cube has none). Attach a Rigidbody to the
+			// main-controller GameObject when missing - the same host CreatePhysicsJoint uses.
+			if (la == "setmass" || la == "setdrag" || la == "addforce") {
+				GameObject go = null;
+				Rigidbody rb = null;
+				Mt.Run(delegate {
+					go = a.mainController != null ? a.mainController.gameObject : a.gameObject;
+					if (go != null) {
+						rb = go.GetComponent<Rigidbody>();
+						if (rb == null) rb = go.AddComponent<Rigidbody>();
+					}
+				}, 10000);
+				if (rb == null) throw new ApiError("could not obtain a Rigidbody host on " + a.uid);
+				r["storable"] = "(rigidbody:" + go.name + ")";
+				if (la == "addforce") {
+					Vector3 dir = Vector3.up;
+					if (Has(args, "direction")) dir = ParseVec3(args["direction"]);
+					float magnitude = Num(args, "force", Num(args, "magnitude", Num(args, "value", 1f)));
+					rb.AddForce(dir.normalized * magnitude, ForceMode.VelocityChange);
+					r["force"] = F(magnitude);
+					Vector3 v = rb.velocity;
+					JSONArray vel = new JSONArray();
+					vel.Add(F(v.x)); vel.Add(F(v.y)); vel.Add(F(v.z));
+					r["velocity"] = vel;
+					r["note"] = "force queued on the Rigidbody; motion only advances while the simulation is unpaused (check set_simulation / IdleSaver)";
+					return r;
+				}
+				if (la == "setmass") {
+					rb.mass = Num(args, "value", 1f);
+					r["mass"] = F(rb.mass);
+					return r;
+				}
+				rb.drag = Num(args, "value", 0.05f);
+				r["drag"] = F(rb.drag);
+				return r;
+			}
+			// remaining actions scan storables for matching float params
 			JSONStorable target = null;
 			string usedSid = "";
 			foreach (string sid in a.GetStorableIDs()) {
@@ -3004,31 +3123,6 @@ namespace VaMMCP.Api {
 			}
 			if (target == null) throw new ApiError("no physics storable on " + a.uid + "; storables: " + string.Join(", ", a.GetStorableIDs().ToArray()));
 			r["storable"] = usedSid;
-			if (la == "addforce") {
-				string p = MatchFloatParam(target, "force");
-				if (p == null) throw new ApiError("no force param on " + usedSid + "; " + ActionHelp(target));
-				float magnitude = Num(args, "magnitude", Num(args, "value", target.GetFloatParamValue(p)));
-				target.SetFloatParamValue(p, magnitude);
-				r["force"] = F(target.GetFloatParamValue(p));
-				string dx = MatchFloatParam(target, "x");
-				string dy = MatchFloatParam(target, "y");
-				string dz = MatchFloatParam(target, "z");
-				if (Has(args, "direction")) {
-					Vector3 d = ParseVec3(args["direction"]);
-					if (dx != null) target.SetFloatParamValue(dx, d.x);
-					if (dy != null) target.SetFloatParamValue(dy, d.y);
-					if (dz != null) target.SetFloatParamValue(dz, d.z);
-				}
-				return r;
-			}
-			if (la == "setmass" || la == "setdrag") {
-				string p = MatchFloatParam(target, la == "setmass" ? "mass" : "drag");
-				if (p == null) throw new ApiError("no such param on " + usedSid + "; " + ActionHelp(target));
-				target.SetFloatParamValue(p, Num(args, "value", 1f));
-				r["param"] = p;
-				r["value"] = F(target.GetFloatParamValue(p));
-				return r;
-			}
 			throw new ApiError("unknown physics action: " + S(args, "action") + "; " + ActionHelp(target));
 		}
 
@@ -3084,7 +3178,7 @@ namespace VaMMCP.Api {
 			r["joint"] = joint.GetType().Name;
 			r["atom_a"] = uidA;
 			r["atom_b"] = uidB;
-			r["note"] = "legacy Unity joint on top of VaM's own physics; VaM soft-body physics may fight it ΓÇö verify visuals and consider a dedicated plugin (BoneControl/BodyAttach) instead";
+			r["note"] = "legacy Unity joint on top of VaM's own physics; VaM soft-body physics may fight it - verify visuals and consider a dedicated plugin (BoneControl/BodyAttach) instead";
 			return r;
 		}
 
@@ -3164,6 +3258,13 @@ namespace VaMMCP.Api {
 					row["storable"] = used;
 					row["params"] = ParamSnapshot(st, 14, 8, 4, 8, 4);
 					row["actions"] = ActionHelp(st);
+					AudioSourceControl ctrl = st as AudioSourceControl;
+					if (ctrl != null) {
+						NamedAudioClip pc = ctrl.playingClip;
+						row["playingClip"] = pc != null ? pc.displayName : "";
+						URLAudioClip uac = pc as URLAudioClip;
+						if (uac != null) row["playingClipReady"] = JSONRaw.Bool(uac.ready);
+					}
 				}
 				arr.Add(row);
 				if (arr.Count >= 60) break;
@@ -3174,20 +3275,157 @@ namespace VaMMCP.Api {
 			return r;
 		}
 
+		/// <summary>Last audio clip path queued per atom+storable, so Play without a clip arg reuses it.</summary>
+		private Dictionary<string, string> _lastAudioClip = new Dictionary<string, string>();
+
+		/// <summary>Clips decoded directly by VaMMCP (PCM WAV), keyed by normalized path.</summary>
+		private Dictionary<string, NamedAudioClip> _ownClips = new Dictionary<string, NamedAudioClip>();
+
+		private static string TailPath(string path) {
+			if (path == null) return "";
+			string t = path.Replace('\\', '/');
+			int i = t.LastIndexOf('/');
+			return i >= 0 ? t.Substring(i + 1) : t;
+		}
+
+		/// <summary>Find a registered NamedAudioClip: VaMMCP's own PCM cache first, then VaM's URL registry (exact uid, then tail name).</summary>
+		private NamedAudioClip FindRegisteredClip(string path) {
+			if (path == null || path == "") return null;
+			string tail = TailPath(path);
+			if (_ownClips.ContainsKey(path)) return _ownClips[path];
+			if (_ownClips.ContainsKey(tail)) return _ownClips[tail];
+			if (URLAudioClipManager.singleton == null) return null;
+			NamedAudioClip n = URLAudioClipManager.singleton.GetClip(path);
+			if (n == null) n = URLAudioClipManager.singleton.GetClip(tail);
+			return n;
+		}
+
+		/// <summary>Decode a 16-bit or 32-bit-float PCM WAV file into an AudioClip on the main thread.</summary>
+		private AudioClip DecodeWav(string path, out string err) {
+			err = "";
+			byte[] bytes = FileManagerSecure.ReadAllBytes(path);
+			if (bytes == null || bytes.Length < 44) { err = "file too short to be a WAV"; return null; }
+			if (bytes[0] != 'R' || bytes[1] != 'I' || bytes[2] != 'F' || bytes[3] != 'F') { err = "not a RIFF/WAV file (raw mp3/ogg waves cannot be decoded here)"; return null; }
+			int fmt = -1, channels = 0, rate = 0, bits = 0;
+			int dataStart = -1, dataLen = 0;
+			int pos = 12;
+			while (pos + 8 <= bytes.Length) {
+				string chunkId = System.Text.Encoding.ASCII.GetString(bytes, pos, 4);
+				int chunkLen = (int)(bytes[pos + 4] | (bytes[pos + 5] << 8) | (bytes[pos + 6] << 16) | (bytes[pos + 7] << 24));
+				if (chunkLen < 0 || pos + 8 + chunkLen > bytes.Length) chunkLen = bytes.Length - pos - 8;
+				if (chunkId == "fmt ") {
+					fmt = (int)(bytes[pos + 8] | (bytes[pos + 9] << 8));
+					channels = (int)(bytes[pos + 10] | (bytes[pos + 11] << 8));
+					rate = (int)(bytes[pos + 12] | (bytes[pos + 13] << 8) | (bytes[pos + 14] << 16) | (bytes[pos + 15] << 24));
+					bits = (int)(bytes[pos + 22] | (bytes[pos + 23] << 8));
+				} else if (chunkId == "data") { dataStart = pos + 8; dataLen = chunkLen; }
+				pos += 8 + chunkLen + (chunkLen % 2);
+			}
+			if (fmt != 1 && fmt != 3) { err = "unsupported WAV encoding " + fmt + " (need PCM 16-bit or float 32-bit)"; return null; }
+			if (fmt == 1 && bits != 16) { err = "unsupported PCM bit depth " + bits + " (need 16-bit or float 32-bit)"; return null; }
+			if (fmt == 3 && bits != 32) { err = "unsupported float bit depth " + bits; return null; }
+			if (dataStart < 0 || channels <= 0 || rate <= 0) { err = "missing fmt/data chunk"; return null; }
+			int sampleBytes = bits / 8;
+			int total = dataLen / sampleBytes;
+			int frames = total / channels;
+			if (frames <= 0) { err = "no audio frames"; return null; }
+			float[] samples = new float[frames * channels];
+			if (fmt == 1) {
+				for (int i = 0; i < samples.Length; i++) {
+					int b = dataStart + i * 2;
+					short s = (short)(bytes[b] | (bytes[b + 1] << 8));
+					samples[i] = s / 32768f;
+				}
+			} else {
+				for (int i = 0; i < samples.Length; i++) {
+					samples[i] = BitConverter.ToSingle(bytes, dataStart + i * 4);
+				}
+			}
+			AudioClip clip = null;
+			Mt.Run(delegate {
+				clip = AudioClip.Create(TailPath(path), frames, channels, rate, false);
+				clip.SetData(samples, 0);
+			}, 10000);
+			if (clip == null) { err = "AudioClip.Create timed out"; return null; }
+			return clip;
+		}
+
 		public JSONNode AudioSourceAction(JSONNode args) {
 			Atom a = FindAtom(S(args, "uid"));
 			JSONStorable st = RequireResolvedStorable(a, "AudioSource", "audio", "AudioSource");
+			AudioSourceControl ctrl = st as AudioSourceControl;
 			string la = S(args, "action").ToLowerInvariant();
-			if (la == "" ) throw new ApiError("action required: Play, Stop, Pause, SetVolume, SetClip, SetLoop");
+			if (la == "" ) throw new ApiError("action required: Play, Stop, Pause, SetClip, SetVolume, SetLoop, UnPause, TogglePause, StopLoop, ClearQueue");
 			JSONClass r = new JSONClass();
 			r["uid"] = a.uid;
-			if (la == "play" || la == "stop" || la == "pause") {
+			r["storable"] = "AudioSource";
+			if (la == "play") {
+				string clipArg = S(args, "clip");
+				if (clipArg == "") {
+					string key = a.uid + "/" + "AudioSource";
+					if (_lastAudioClip.ContainsKey(key)) clipArg = _lastAudioClip[key];
+				}
+				if (ctrl == null) throw new ApiError("audio storable on " + a.uid + " is not a VaM AudioSourceControl; " + ActionHelp(st));
+				NamedAudioClip nac = FindRegisteredClip(clipArg);
+				if (nac == null) throw new ApiError("no registered audio clip '" + (clipArg == "" ? "(none set yet - call SetClip first)" : clipArg) + "'; use audio_source_action SetClip with a path (Custom/Sounds/...)");
+				URLAudioClip uac = nac as URLAudioClip;
+				if (uac != null && !uac.ready) throw new ApiError("clip '" + uac.displayName + "' is registered but not loaded yet (ready=false); retry Play in a moment");
+				if (Bool(args, "loop", true)) ctrl.PlayNowLoop(nac);
+				else ctrl.PlayNow(nac);
+				r["playing"] = ctrl.playingClip != null ? ctrl.playingClip.displayName : nac.displayName;
+				return r;
+			}
+			if (la == "stop" || la == "pause" || la == "unpause" || la == "togglepause" || la == "stoploop" || la == "clearqueue" || la == "stopandclearqueue") {
 				JSONStorableAction act = FindActionCI(st, la);
 				if (act != null && act.actionCallback != null) { act.actionCallback(); r["called"] = act.name; return r; }
-				// fallback: drive play/loop bools
-				string p = la == "play" ? MatchBoolParam(st, "play") : null;
-				if (p != null) { st.SetBoolParamValue(p, la == "play"); r[p] = JSONRaw.Bool(st.GetBoolParamValue(p)); return r; }
 				throw new ApiError("no " + la + " action; " + ActionHelp(st));
+			}
+			if (la == "setclip") {
+				string path = S(args, "value");
+				if (path == "") throw new ApiError("value required: audio file path (mp3|ogg|wav, e.g. Custom/Sounds/...) or package path");
+				string key = a.uid + "/" + "AudioSource";
+				_lastAudioClip[key] = path;
+				string norm = SuperController.singleton != null ? SuperController.singleton.NormalizeMediaPath(path) : path;
+				bool isLocalPcmWav = !norm.StartsWith("http", StringComparison.OrdinalIgnoreCase)
+					&& TailPath(norm).ToLowerInvariant().EndsWith(".wav", StringComparison.Ordinal);
+				if (ctrl == null) {
+					string p = MatchUrlParam(st, "url");
+					if (p == null) p = MatchUrlParam(st, "source");
+					if (p == null) throw new ApiError("no audio url param and storable is not a VaM AudioSourceControl; " + ActionHelp(st));
+					st.SetUrlParamValue(p, path);
+					r["url"] = st.GetUrlParamValue(p);
+					return r;
+				}
+				if (isLocalPcmWav) {
+					string err = "";
+					string abs = norm.StartsWith("file", StringComparison.OrdinalIgnoreCase)
+						? norm.Replace("file://./", "").Replace("file://", "") : norm;
+					AudioClip clip = null;
+					try { clip = DecodeWav(abs, out err); } catch (Exception e) { err = e.Message; }
+					if (clip == null) throw new ApiError("wav decode failed for " + abs + ": " + err);
+					NamedAudioClip nac = new NamedAudioClip();
+					nac.uid = norm;
+					nac.displayName = TailPath(norm);
+					nac.category = "web";
+					nac.sourceClip = clip;
+					_ownClips[norm] = nac;
+					_ownClips[nac.displayName] = nac;
+					r["clip"] = nac.displayName;
+					r["url"] = norm;
+					r["ready"] = JSONRaw.Bool(true);
+					r["note"] = "PCM WAV decoded directly; audio_source_action Play (pass loop=false for one-shot)";
+					return r;
+				}
+				if (URLAudioClipManager.singleton == null) throw new ApiError("URLAudioClipManager not available this session and " + norm + " is not a local PCM wav");
+				URLAudioClip uac = URLAudioClipManager.singleton.QueueClip(norm, null);
+				if (uac == null) uac = FindRegisteredClip(norm) as URLAudioClip;
+				if (uac == null) throw new ApiError("clip queueing failed for " + norm + " (file exists? extension mp3|ogg|wav?)");
+				r["clip"] = uac.displayName;
+				r["url"] = uac.url;
+				r["ready"] = JSONRaw.Bool(uac.ready);
+				r["note"] = uac.ready ? "clip ready; audio_source_action Play (or pass loop=false)"
+					: "clip queued on VaM's own audio loader (ogg/mp3); retry Play shortly - if ready stays false, open VaM's Sound tab once so its importer wakes up";
+				return r;
 			}
 			if (la == "setvolume") {
 				string p = MatchFloatParam(st, "volume");
@@ -3196,19 +3434,21 @@ namespace VaMMCP.Api {
 				r["volume"] = F(st.GetFloatParamValue(p));
 				return r;
 			}
-			if (la == "setclip") {
-				string p = MatchUrlParam(st, "url");
-				if (p == null) p = MatchUrlParam(st, "source");
-				if (p == null) throw new ApiError("no audio url param; " + ActionHelp(st));
-				st.SetUrlParamValue(p, S(args, "value"));
-				r["url"] = st.GetUrlParamValue(p);
-				return r;
-			}
 			if (la == "setloop") {
 				string p = MatchBoolParam(st, "loop");
 				if (p == null) throw new ApiError("no loop param; " + ActionHelp(st));
 				st.SetBoolParamValue(p, Bool(args, "value", true));
 				r["loop"] = JSONRaw.Bool(st.GetBoolParamValue(p));
+				return r;
+			}
+			if (la == "playnext" || la == "queueclip") {
+				if (ctrl == null) throw new ApiError("no audio-clip action on non-VaM audio storable; " + ActionHelp(st));
+				string clipArg = S(args, "clip");
+				NamedAudioClip nac = FindRegisteredClip(clipArg);
+				if (nac == null) throw new ApiError("clip '" + clipArg + "' not registered; SetClip first");
+				if (la == "queueclip") ctrl.QueueClip(nac);
+				else ctrl.PlayNext(nac);
+				r["queued"] = nac.displayName;
 				return r;
 			}
 			throw new ApiError("unknown audio action: " + S(args, "action") + "; " + ActionHelp(st));
@@ -3447,20 +3687,22 @@ namespace VaMMCP.Api {
 			JSONClass r = new JSONClass();
 			r["uid"] = a.uid;
 			if (la == "select") {
-				Exception last = null;
-				foreach (string m in new string[] { "SelectAtom", "SetSelectedAtom", "Select" }) {
-					try {
-						if (m == "Select") Invoke(SC, "SelectAtom", a);
-						else Invoke(SC, m, a);
-						r["selected"] = JSONRaw.Bool(true);
-						r["via"] = m;
-						return r;
-					} catch (Exception e) { last = e; }
+				// VaM's selection API is SelectatomWithPopup (chooser) or SelectController
+				// (FreeControllerV3 / (atomName, controllerName) / string atom name).
+				try {
+					FreeControllerV3 fc = a.mainController;
+					if (fc == null) throw new ApiError(a.uid + " has no mainController to select");
+					SC.SelectController(fc);
+					r["selected"] = JSONRaw.Bool(true);
+					r["via"] = "SelectController(mainController)";
+					return r;
+				} catch (Exception e) {
+					throw new ApiError("atom selection failed: " + e.Message + "; click the atom in the VaM scene panel instead");
 				}
-				throw new ApiError("atom selection not available via any known API (" + (last != null ? last.Message : "no match") + "); click the atom in the VaM scene panel instead");
 			}
 			if (la == "freezephysics" || la == "unfreezephysics") {
 				bool freeze = la == "freezephysics";
+				if (freeze && Has(args, "value") && !Bool(args, "value", true)) freeze = false;
 				int touched = 0;
 				// physics freeze = the FreeControllerV3 position/rotation state choosers ("Freeze" vs "Off" = physics-driven)
 				string wantState = freeze ? "Freeze" : "Off";
@@ -3476,7 +3718,7 @@ namespace VaMMCP.Api {
 					} catch (Exception e) { r[sid + ".error"] = e.Message; }
 				}
 				r["touched"] = JSONRaw.Num(touched);
-				r["note"] = freeze ? "controllers forced to Freeze (physics stops moving them); UnfreezePhysics sets them back to Off (physics-driven)"
+				r["note"] = freeze ? "controllers forced to Freeze (physics stops moving them); UnfreezePhysics (or value=false) sets them back to Off (physics-driven)"
 					: "controllers returned to Off (physics-driven); a captured On-state pose would need set_control";
 				return r;
 			}
@@ -3497,14 +3739,16 @@ namespace VaMMCP.Api {
 			}
 			if (la == "isolateedit" || la == "endisolate") {
 				bool want = la == "isolateedit";
-				Exception last = null;
-				foreach (string m in new string[] { "SetAtomIsolate", "IsolateAtom", "ToggleIsolate" }) {
-					try { Invoke(SC, m, a, want); r["isolate"] = JSONRaw.Bool(want); r["via"] = m; return r; } catch (Exception e) { last = e; }
+				// VaM 1.22: SuperController.EndIsolateEditAtom() ends any atom isolation;
+				// there is no public per-atom isolate call, so IsolateEdit routes through
+				// select-atom + the editor's own isolate (not supported programmatically).
+				if (!want) {
+					SC.EndIsolateEditAtom();
+					r["isolate"] = JSONRaw.Bool(false);
+					r["via"] = "EndIsolateEditAtom()";
+					return r;
 				}
-				foreach (string m in new string[] { "Isolate", "EndIsolate" }) {
-					try { Invoke(a, m); r["isolate"] = JSONRaw.Bool(want); r["via"] = m; return r; } catch (Exception e) { last = e; }
-				}
-				throw new ApiError("isolate not available via any known API (" + (last != null ? last.Message : "no match") + "); use VaM's scene editor isolation instead");
+				throw new ApiError("IsolateEdit is not exposed by VaM's API (only EndIsolateEditAtom exists; entering isolation is an editor UI action)");
 			}
 			if (la == "disablerender" || la == "enablerender") {
 				// hiding an atom safely = VaM's own on toggle; killing mainController GameObjects breaks physics
@@ -3629,46 +3873,70 @@ namespace VaMMCP.Api {
 			if (la == "") throw new ApiError("action required: ArmRecord, RecordAnimation, PlaybackEnabled, PlayAnimation, StopAnimation");
 			JSONClass r = new JSONClass();
 			r["uid"] = p.uid;
-			// find the per-person animation storable (id pattern varies by setup)
-			JSONStorable st = null;
+			// MotionAnimationControl exists per bone (abdomen2Animation, ...); apply to ALL of them
+			List<JSONStorable> storables = new List<JSONStorable>();
 			string used = "";
 			foreach (string sid in p.GetStorableIDs()) {
-				if (sid.IndexOf("animation", StringComparison.OrdinalIgnoreCase) < 0) continue;
-				st = p.GetStorableByID(sid);
-				used = sid;
-				break;
+				if (!sid.EndsWith("Animation", StringComparison.OrdinalIgnoreCase) && sid != "animation" && sid != "AnimationControl") continue;
+				JSONStorable s = p.GetStorableByID(sid);
+				if (s == null) continue;
+				storables.Add(s);
+				if (used == "") used = sid;
 			}
-			if (st == null) {
-				throw new ApiError("no animation storable on " + p.uid + "; VaM drives person animation via AnimationPattern atoms (list_animation_patterns) or pose presets (load_pose); a plugin may be needed for bone recording");
+			if (storables.Count == 0) {
+				throw new ApiError("no animation storables on " + p.uid + "; VaM drives person animation via AnimationPattern atoms (list_animation_patterns) or pose presets (load_pose); a plugin may be needed for bone recording");
 			}
-			r["storable"] = used;
+			r["storables"] = JSONRaw.Num(storables.Count);
+			r["first"] = used;
+			int touched = 0;
 			if (la == "armrecord" || la == "recordanimation") {
-				JSONStorableAction act = FindActionCI(st, "record");
-				if (act == null) act = FindActionCI(st, "arm");
-				if (act == null) act = FindActionCI(st, "start");
-				if (act != null && act.actionCallback != null) { act.actionCallback(); r["called"] = act.name; return r; }
-				string bp = MatchBoolParam(st, "record");
-				if (bp != null) { st.SetBoolParamValue(bp, true); r[bp] = JSONRaw.Bool(st.GetBoolParamValue(bp)); return r; }
-				throw new ApiError("no record action/param on " + used + "; " + ActionHelp(st));
+				r["called"] = new JSONArray();
+				foreach (JSONStorable st in storables) {
+					try {
+						JSONStorableAction act = FindActionCI(st, "record");
+						if (act == null) act = FindActionCI(st, "arm");
+						if (act == null) act = FindActionCI(st, "start");
+						if (act != null && act.actionCallback != null) { act.actionCallback(); touched++; r["called"].Add(act.name); continue; }
+						string bp = MatchBoolParam(st, "record");
+						if (bp != null) { st.SetBoolParamValue(bp, true); touched++; }
+					} catch (Exception) { }
+				}
+				if (touched == 0) throw new ApiError("no record action/param on " + used + "; " + ActionHelp(storables[0]));
+				r["touched"] = JSONRaw.Num(touched);
+				return r;
 			}
 			if (la == "playbackenabled") {
-				string bp = MatchBoolParam(st, "playback");
-				if (bp == null) bp = MatchBoolParam(st, "enabled");
-				if (bp == null) throw new ApiError("no playback param on " + used + "; " + ActionHelp(st));
-				st.SetBoolParamValue(bp, Bool(args, "value", true));
-				r[bp] = JSONRaw.Bool(st.GetBoolParamValue(bp));
+				bool v = Bool(args, "value", true);
+				foreach (JSONStorable st in storables) {
+					try {
+						string bp = MatchBoolParam(st, "playback");
+						if (bp == null) bp = MatchBoolParam(st, "enabled");
+						if (bp == null) continue;
+						st.SetBoolParamValue(bp, v);
+						touched++;
+					} catch (Exception) { /* skip storables that reject playback writes */ }
+				}
+				if (touched == 0) throw new ApiError("no playback param on " + used + "; " + ActionHelp(storables[0]));
+				r["touched"] = JSONRaw.Num(touched);
 				return r;
 			}
 			if (la == "playanimation" || la == "stopanimation") {
 				bool play = la == "playanimation";
-				JSONStorableAction act = FindActionCI(st, play ? "play" : "stop");
-				if (act != null && act.actionCallback != null) { act.actionCallback(); r["called"] = act.name; return r; }
-				string bp = MatchBoolParam(st, "play");
-				if (bp == null) bp = MatchBoolParam(st, "playing");
-				if (bp != null) { st.SetBoolParamValue(bp, play); r[bp] = JSONRaw.Bool(st.GetBoolParamValue(bp)); return r; }
-				throw new ApiError("no play/stop control on " + used + "; " + ActionHelp(st));
+				r["called"] = new JSONArray();
+				foreach (JSONStorable st in storables) {
+					try {
+						JSONStorableAction act = FindActionCI(st, play ? "play" : "stop");
+						if (act != null && act.actionCallback != null) { act.actionCallback(); touched++; r["called"].Add(act.name); continue; }
+						string bp = MatchBoolParam(st, "play");
+						if (bp == null) bp = MatchBoolParam(st, "playing");
+						if (bp != null) { st.SetBoolParamValue(bp, play); touched++; }
+					} catch (Exception) { }
+				}
+				if (touched == 0) throw new ApiError("no play/stop control on " + used + "; " + ActionHelp(storables[0]));
+				r["touched"] = JSONRaw.Num(touched);
+				return r;
 			}
-			throw new ApiError("unknown animation action: " + S(args, "action") + "; " + ActionHelp(st));
+			throw new ApiError("unknown animation action: " + S(args, "action") + "; " + ActionHelp(storables[0]));
 		}
 
 		// ===================== custom unity assets =====================
@@ -4229,16 +4497,40 @@ namespace VaMMCP.Api {
 			JSONStorable st = ResolveStorable(p, ctrlId, hand == "left" ? "lhand" : "rhand", out used);
 			if (st == null) throw new ApiError("no " + ctrlId + " control on " + p.uid + "; storables: " + string.Join(", ", p.GetStorableIDs().ToArray()));
 			r["storable"] = used;
+			FreeControllerV3 fc = st as FreeControllerV3;
 			if (la == "settarget") {
+				if (fc == null) throw new ApiError(st.GetType().Name + " is not a FreeControllerV3; cannot aim it");
 				string target = S(args, "target_uid");
-				// FreeControllerV3 look-at: try a look-at target chooser first
-				string lookParam = MatchChooserParam(st, "lookat");
-				if (lookParam != null) {
-					st.SetStringChooserParamValue(lookParam, target);
-					r["lookAt"] = st.GetStringChooserParamValue(lookParam);
-					return r;
+				if (target == "") throw new ApiError("target_uid required (atom uid the hand should look at, e.g. an object or 'Camera')");
+				if (target.ToLowerInvariant() == "camera") {
+					Mt.Run(delegate {
+						fc.lookAt = Camera.main != null ? Camera.main.transform : null;
+					}, 10000);
+					if (fc.lookAt == null) throw new ApiError("no main camera found to aim at");
+				} else {
+					Atom t = FindAtom(target);
+					Mt.Run(delegate {
+						fc.lookAt = t.mainController != null ? t.mainController.transform : t.transform;
+					}, 10000);
 				}
-				throw new ApiError("no look-at target chooser on the hand control (available params visible via list_storable_params storable=" + used + "); position the hand with set_control instead");
+				string rsParam = MatchChooserParam(st, "rotationState");
+				if (rsParam != null) st.SetStringChooserParamValue(rsParam, "LookAt");
+				r["lookAt"] = target;
+				r["rotationState"] = rsParam != null ? st.GetStringChooserParamValue(rsParam) : "unchanged";
+				return r;
+			}
+			if (la == "setrotation") {
+				if (fc == null) throw new ApiError(st.GetType().Name + " is not a FreeControllerV3; cannot rotate it");
+				if (args["value"] == null) throw new ApiError("value required: rotation euler [x,y,z] in degrees");
+				Vector3 rot = ParseVec3(args["value"]);
+				Mt.Run(delegate { fc.SetRotationNoForce(rot); }, 10000);
+				r["rotation"] = Vec(fc.control.eulerAngles);
+				return r;
+			}
+			if (la == "setweight") {
+				string weightParam = MatchFloatParam(st, "weight");
+				if (weightParam != null) { st.SetFloatParamValue(weightParam, Num(args, "value", 1f)); r["weight"] = F(st.GetFloatParamValue(weightParam)); return r; }
+				throw new ApiError("no IK weight param on a stock FreeControllerV3 - a stock hand follows either its pose or its look-at target (settarget), there is no blend weight; use settarget + setrotation instead");
 			}
 			if (la == "autograsp" || la == "release") {
 				string graspParam = MatchBoolParam(st, "grasp");
@@ -4247,7 +4539,7 @@ namespace VaMMCP.Api {
 				if (graspParam != null) { st.SetFloatParamValue(graspParam, la == "autograsp" ? Num(args, "value", 1f) : 0f); r["grasp"] = F(st.GetFloatParamValue(graspParam)); return r; }
 				throw new ApiError("no grasp param on the hand control; " + ActionHelp(st));
 			}
-			throw new ApiError("unknown hand action: " + S(args, "action") + "; weights/grasp live on the hands look plugin if present ΓÇö see list_plugins");
+			throw new ApiError("unknown hand action: " + S(args, "action") + "; use SetTarget, SetRotation, AutoGrasp or Release");
 		}
 
 		// ===================== person material =====================
@@ -4313,7 +4605,7 @@ namespace VaMMCP.Api {
 		}
 
 		/// <summary>Poller tool. Browse the VaM Hub (community resources) via the game's own Hub API.
-		/// Uses UnityWebRequest (Unity's TLS) ΓÇö plain HttpWebRequest cannot speak TLS1.2 on the .NET 3.5 profile.</summary>
+		/// Uses UnityWebRequest (Unity's TLS) - plain HttpWebRequest cannot speak TLS1.2 on the .NET 3.5 profile.</summary>
 		public JSONNode HubBrowse(JSONNode args) {
 			string apiUrl = Mt.Run(() => HubApiUrl(), 10000);
 			JSONClass body = new JSONClass();
@@ -4679,7 +4971,7 @@ namespace VaMMCP.Api {
 				sb.Append("      return (" + code + ");\n");
 			}
 			sb.Append("    } catch (System.Exception __e) {\n");
-			// NOTE: __e.ToString() ΓÇö NOT __e.GetType().Name: Type.Name is declared on System.Reflection.MemberInfo,
+			// NOTE: __e.ToString() - NOT __e.GetType().Name: Type.Name is declared on System.Reflection.MemberInfo,
 			// which VaM's DynamicCSharp sandbox prohibits (NamespaceRestriction).
 			sb.Append("      __error = __e.ToString();\n");
 			sb.Append("      return null;\n");
