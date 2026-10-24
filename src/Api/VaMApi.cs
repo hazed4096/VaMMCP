@@ -10,6 +10,7 @@ using System.Threading;
 using UnityEngine;
 using SimpleJSON;
 using MVR.FileManagementSecure;
+using MeshVR;
 
 namespace VaMMCP.Api {
 	/// <summary>
@@ -75,6 +76,14 @@ namespace VaMMCP.Api {
 			DAZCharacterSelector sel = g as DAZCharacterSelector;
 			if (sel == null) throw new ApiError("geometry is not a DAZCharacterSelector on " + p.uid);
 			return sel;
+		}
+
+		/// <summary>The internal person object tree: 'other' -> 'Geometry' -> 'character' ...
+		/// The Hair/Clothing creator items hang under parts of it that VaM keeps disabled
+		/// until the matching tab opened once. Ancestors of the creator item up to the
+		/// containing atom's transform are the activation path.</summary>
+		private static Transform containingAtomRoot(Atom p) {
+			return p != null ? p.transform : null;
 		}
 
 		public static JSONClass AtomInfo(Atom a) {
@@ -836,7 +845,11 @@ namespace VaMMCP.Api {
 				string name = FileName(f);
 				if (search != "" && name.ToLowerInvariant().IndexOf(search) < 0 && f.ToLowerInvariant().IndexOf(search) < 0) continue;
 				JSONClass row = new JSONClass();
-				row["path"] = f;
+				// FileManagerSecure returns 'Custom/Clothing\Female\...' style paths;
+				// forward-slash the value we hand out so paths copy-paste straight
+				// into add_clothing_item / add_hair_item / LoadFromPath, which
+				// silently no-op on the backslashed form.
+				row["path"] = f.Replace('\\', '/');
 				row["name"] = name;
 				row["package"] = pkg;
 				arr.Add(row);
@@ -855,7 +868,7 @@ namespace VaMMCP.Api {
 				string name = FileName(f);
 				if (s != "" && name.ToLowerInvariant().IndexOf(s) < 0 && f.ToLowerInvariant().IndexOf(s) < 0) continue;
 				JSONClass row = new JSONClass();
-				row["path"] = f;
+				row["path"] = f.Replace('\\', '/');
 				row["name"] = name;
 				arr.Add(row);
 			}
@@ -871,7 +884,7 @@ namespace VaMMCP.Api {
 				string name = FileName(f);
 				if (s != "" && name.ToLowerInvariant().IndexOf(s) < 0 && f.ToLowerInvariant().IndexOf(s) < 0) continue;
 				JSONClass row = new JSONClass();
-				row["path"] = f;
+				row["path"] = f.Replace('\\', '/');
 				row["name"] = name;
 				arr.Add(row);
 			}
@@ -1170,6 +1183,13 @@ namespace VaMMCP.Api {
 			Atom p = Mt.Run(() => RequirePerson(S(args, "person")), 15000);
 			string path = S(args, "path");
 			if (path == "") throw new ApiError("path required (clothing item .vam/.json file, e.g. from list_clothing_presets)");
+			// list_clothing_presets emits the slashes VaM's DirFileFactory reports
+			// ('Custom/Clothing\Female\...'), but DAZRuntimeCreator.LoadFromPath
+			// silently does nothing on such mixed-separator paths (verified: a
+			// backslashed add produced no item, the same path with '/' worked and
+			// reported "activated"). Normalize before use - VaM itself only parses
+			// 'package:/Custom/...', with '/' as the separator.
+			path = path.Replace('\\', '/');
 			int waitSeconds = Has(args, "wait_seconds") ? args["wait_seconds"].AsInt : 20;
 			if (waitSeconds < 1) waitSeconds = 1;
 			string wanted = path.Substring(path.LastIndexOf('/') + 1);
@@ -1339,27 +1359,91 @@ namespace VaMMCP.Api {
 			return r;
 		}
 
+		/// <summary>Wait (on the HTTP thread) until a person's async hair state is stable:
+		/// the hair-item snapshot (uid:active:ready for every hair item) unchanged for
+		/// stableSecs with a guaranteed minimum wait of minSecs, and no ACTIVE hair item
+		/// still reporting ready=false. Guards against the person's own restore pass
+		/// rewriting hair toggles after we set them.</summary>
+		private void WaitForHairStable(Atom p, int minSecs) {
+			DateTime deadline = DateTime.UtcNow.AddSeconds(Math.Max(minSecs, 10));
+			DateTime overallStart = DateTime.UtcNow;
+			string lastSnap = null;
+			DateTime stableSince = DateTime.UtcNow;
+			while (DateTime.UtcNow < deadline) {
+				Func<string> snap = delegate {
+					try {
+						DAZCharacterSelector sel2 = Selector(p);
+						StringBuilder sb2 = new StringBuilder();
+						DAZHairGroup[] hi = sel2.hairItems;
+						if (hi == null) return "";
+						foreach (DAZHairGroup hg in hi) {
+							JSONStorableDynamic jsd = hg as JSONStorableDynamic;
+							bool unready = jsd != null && !jsd.ready && hg.active;
+							sb2.Append(hg.uid).Append(':').Append(hg.active).Append(unready ? 'N' : 'r').Append(';');
+						}
+						return sb2.ToString();
+					} catch { return ""; }
+				};
+				string s = Mt.Run(snap, 15000);
+				if (s != lastSnap) {
+					lastSnap = s;
+					stableSince = DateTime.UtcNow;
+					Log.Info("[VaMMCP] hair snapshot changed (len=" + s.Length + "): " + s.Substring(0, Math.Min(s.Length, 120)));
+				}
+				bool stableFor = (DateTime.UtcNow - stableSince).TotalSeconds >= 3;
+				bool minOk = (DateTime.UtcNow - overallStart).TotalSeconds >= Math.Max(minSecs, 10);
+				if (stableFor && minOk && lastSnap.IndexOf('N') < 0) return;
+				Thread.Sleep(250);
+			}
+		}
+
 		/// <summary>Poller tool. Adds a hair item to a person from its .vam/.json path.</summary>
 		public JSONNode AddHairItem(JSONNode args) {
 			Atom p = Mt.Run(() => RequirePerson(S(args, "person")), 15000);
 			string path = S(args, "path");
 			if (path == "") throw new ApiError("path required (hair item .vam/.json file, e.g. from list_hair_presets)");
-			DAZHairGroup creator = Mt.Run(delegate {
+			// same mixed-separator problem as add_clothing_item: LoadFromPath no-ops
+			// on 'Custom/...\...' paths, so normalize to '/' before use.
+			path = path.Replace('\\', '/');
+			WaitForHairStable(p, 8);
+			// PRIMARY path: every hair .vam already installed on the machine is an item
+			// under the person (field dynamicRuntimeLoadPath mirrors the library path).
+			// The creator detour was wrong - toggling the matching item IS the add.
+			DAZHairGroup target = Mt.Run(delegate {
 				DAZCharacterSelector sel = Selector(p);
-				return sel.gender == DAZCharacterSelector.Gender.Male ? sel.maleHairCreatorItem : sel.femaleHairCreatorItem;
+				DAZHairGroup[] hi = sel.hairItems;
+				if (hi == null) return null;
+				foreach (DAZHairGroup hg in hi) {
+					if (hg == null) continue;
+					if (hg.uid == path) return hg;
+					DAZDynamicItem di = hg as DAZDynamicItem;
+					if (di != null && di.dynamicRuntimeLoadPath == path) return hg;
+				}
+				// fallback: name-only match when unique
+				string wanted = path.Substring(path.LastIndexOf('/') + 1);
+				if (wanted.EndsWith(".vam", StringComparison.OrdinalIgnoreCase)) wanted = wanted.Substring(0, wanted.Length - 4);
+				DAZHairGroup nameHit = null;
+				foreach (DAZHairGroup hg2 in hi) {
+					if (hg2 != null && hg2.name == wanted) {
+						if (nameHit != null) return null; // ambiguous
+						nameHit = hg2;
+					}
+				}
+				return nameHit;
 			}, 15000);
-			if (creator == null) throw new ApiError("no hair creator item available");
-			Mt.Run(() => { try { Invoke(Selector(p), "SetActiveHairItem", creator, true); } catch { } }, 15000);
-			Component drc = PollComponent(creator, 40);
-			if (drc == null) throw new ApiError("no DAZRuntimeCreator component on the creator item (character may still be loading; retry in a few seconds)");
-			Mt.Run(() => Invoke(drc, "LoadFromPath", path), 15000);
-			JSONClass r = new JSONClass();
-			r["person"] = p.uid;
-			r["path"] = path;
-			r["loading"] = JSONRaw.Bool(true);
-			return r;
+			if (target != null) {
+				Mt.Run(() => Selector(p).SetActiveHairItem(target, true), 15000);
+				JSONClass r = new JSONClass();
+				r["person"] = p.uid;
+				r["path"] = path;
+				r["added"] = target.uid;
+				r["active"] = JSONRaw.Bool(true);
+				return r;
+			}
+			// Rare path: hair not installed/wrong path - report rather than fiddling
+			// with the runtime creator (that in-game flow is the hair AUTHOR one).
+			throw new ApiError("no hair item on " + p.uid + " matches " + path + " (check the path with list_hair_presets; the hair must be installed)");
 		}
-
 		/// <summary>Poll (on the HTTP thread, via the dispatcher) until the component appears or the deadline passes.</summary>
 		private Component PollComponent(Component root, int seconds) {
 			DateTime deadline = DateTime.UtcNow.AddSeconds(seconds);
@@ -2832,7 +2916,7 @@ namespace VaMMCP.Api {
 					}
 				}
 			}
-			throw new ApiError("no matching action for " + S(args, "action") + "; " + ActionHelp(st) + "; VaM opens trigger UIs by double-clicking the atom in the scene panel — automate that with press_key/tab keys if needed");
+			throw new ApiError("no matching action for " + S(args, "action") + "; " + ActionHelp(st) + "; VaM opens trigger UIs by double-clicking the atom in the scene panel ΓÇö automate that with press_key/tab keys if needed");
 		}
 
 		// ===================== physics =====================
@@ -3000,7 +3084,7 @@ namespace VaMMCP.Api {
 			r["joint"] = joint.GetType().Name;
 			r["atom_a"] = uidA;
 			r["atom_b"] = uidB;
-			r["note"] = "legacy Unity joint on top of VaM's own physics; VaM soft-body physics may fight it — verify visuals and consider a dedicated plugin (BoneControl/BodyAttach) instead";
+			r["note"] = "legacy Unity joint on top of VaM's own physics; VaM soft-body physics may fight it ΓÇö verify visuals and consider a dedicated plugin (BoneControl/BodyAttach) instead";
 			return r;
 		}
 
@@ -4163,7 +4247,7 @@ namespace VaMMCP.Api {
 				if (graspParam != null) { st.SetFloatParamValue(graspParam, la == "autograsp" ? Num(args, "value", 1f) : 0f); r["grasp"] = F(st.GetFloatParamValue(graspParam)); return r; }
 				throw new ApiError("no grasp param on the hand control; " + ActionHelp(st));
 			}
-			throw new ApiError("unknown hand action: " + S(args, "action") + "; weights/grasp live on the hands look plugin if present — see list_plugins");
+			throw new ApiError("unknown hand action: " + S(args, "action") + "; weights/grasp live on the hands look plugin if present ΓÇö see list_plugins");
 		}
 
 		// ===================== person material =====================
@@ -4229,7 +4313,7 @@ namespace VaMMCP.Api {
 		}
 
 		/// <summary>Poller tool. Browse the VaM Hub (community resources) via the game's own Hub API.
-		/// Uses UnityWebRequest (Unity's TLS) — plain HttpWebRequest cannot speak TLS1.2 on the .NET 3.5 profile.</summary>
+		/// Uses UnityWebRequest (Unity's TLS) ΓÇö plain HttpWebRequest cannot speak TLS1.2 on the .NET 3.5 profile.</summary>
 		public JSONNode HubBrowse(JSONNode args) {
 			string apiUrl = Mt.Run(() => HubApiUrl(), 10000);
 			JSONClass body = new JSONClass();
@@ -4595,7 +4679,7 @@ namespace VaMMCP.Api {
 				sb.Append("      return (" + code + ");\n");
 			}
 			sb.Append("    } catch (System.Exception __e) {\n");
-			// NOTE: __e.ToString() — NOT __e.GetType().Name: Type.Name is declared on System.Reflection.MemberInfo,
+			// NOTE: __e.ToString() ΓÇö NOT __e.GetType().Name: Type.Name is declared on System.Reflection.MemberInfo,
 			// which VaM's DynamicCSharp sandbox prohibits (NamespaceRestriction).
 			sb.Append("      __error = __e.ToString();\n");
 			sb.Append("      return null;\n");

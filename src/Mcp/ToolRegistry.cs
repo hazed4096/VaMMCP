@@ -482,8 +482,9 @@ namespace VaMMCP.Mcp {
 				.Fn(api.StorableDiff));
 			tools.Add(new Tool("scene_dependencies", "Analyze scene dependencies: missing packages, broken references, missing assets.")
 				.Fn(a => api.SceneDependencies()));
-			tools.Add(new Tool("performance_profile", "Run a short performance profile: frame times, GC, physics, render, scripts.")
+			tools.Add(new Tool("performance_profile", "Run a short performance profile: frame times, GC, physics, render, scripts. Runs on the HTTP worker thread - it polls Plugin.frameTick live instead of occupying the main-thread dispatcher, which would freeze the loop it observes.")
 				.P("duration_ms", "number", "Profile duration in ms (default 5000)", false)
+				.Worker()
 				.Fn(api.PerformanceProfile));
 
 			// ---------- hub / community resources ----------

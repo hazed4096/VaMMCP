@@ -46,8 +46,17 @@ HTTP worker thread (TcpListener @127.0.0.1:9837)
 - **All VaM/Unity API access must happen on the main thread**; tool handlers are wrapped in `Run()`
   by default.
 - **Polling tools** (`Tool.NeedsPoller = true`: `add_atom`, `add_person`, `add_plugin`, `hub_*`,
-  `add_clothing_item`) run on the HTTP thread and call `Mt.Run` in slices, because VaM creates and
-  loads things through coroutines that have to be waited on.
+  `add_clothing_item`, `add_hair_item`, `open_clothing_tab`) run on the HTTP thread and call
+  `Mt.Run` in slices, because VaM creates and loads things through coroutines that have to be
+  waited on. **Never `Thread.Sleep` inside a main-thread tool** - it freezes the whole loop for
+  the sleep's whole duration (the add_hair_item hang); long waits belong in a poller/worker tool.
+- **Worker tools** (`Tool.RunOnWorker = true`: `performance_profile`) run fully on a worker
+  thread and only *read* main-thread state, so their sampling does not stall the loop they
+  measure.
+- **Nested `Mt.Run` is safe since the inline fast-path** (`Plugin.mainThreadId`): a handler that
+  runs on the main thread and nests `Mt.Run` executes its inner delegate immediately instead of
+  enqueueing a token that could only drain on the next `Update()` frame (a guaranteed 10 s
+  hang before). Worker-side callers still enqueue and wait for the main thread.
 - **HTTP layer:** MCP Streamable HTTP (2025-06-18). `POST /mcp` → JSON-RPC response
   (`application/json`); `GET` → 405 (allowed by the spec, means "no SSE stream"); notifications →
   202. Loopback bind + Origin validation (DNS-rebinding protection), at most 32 concurrent
@@ -78,6 +87,7 @@ HTTP worker thread (TcpListener @127.0.0.1:9837)
 | `save_look` directories | VaM preset folders are `Saves/Person/{Appearance,Pose,full}` |
 | An added person's uid may be renamed | VaM's `CreateUID` logic — trust the tool's return value |
 | eval sandbox | System.IO / System.Reflection / System.AppDomain / UnityEditor / Mono.Cecil are blocked by VaM's runtime security policy |
+| Unfocused fullscreen VaM stops ticking | exclusive fullscreen pauses Unity's loop on focus loss: no `Update()`, no `Mt.Run` drain, every MCP tool hangs. Launch windowed (`start_vam.ps1` passes `-screen-fullscreen 0`); the plugin re-asserts `Application.runInBackground` every frame |
 
 ## VaM API cheat sheet
 

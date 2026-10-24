@@ -74,7 +74,7 @@ VaM runtime status: plugin version, VaM version, atom/person counts, endpoint, e
 | `add_clothing_item` | `path`*, `person?`, `wait_seconds?` | Add a clothing item (`.vam` package path); activates an existing library item when possible, otherwise blocks until VaM confirms it is worn, and returns `ok:false` + hint when nothing could be added |
 | `remove_clothing_item` | `id`*, `person?` | Remove an item (deletion is deferred to the end of the frame; confirm with `list_clothing_items`) |
 | `set_clothing_item_on` | `id`*, `on`*, `person?` | Wear / take off |
-| `list_hair_presets` / `load_hair_preset` / `list_hair_items` / `add_hair_item` / `remove_hair_item` / `set_hair_item_on` | same as clothing | Hair (`Custom/Hair`) |
+| `list_hair_presets` / `load_hair_preset` / `list_hair_items` / `add_hair_item` / `remove_hair_item` / `set_hair_item_on` | `add_hair_item`: `path`*, `person?` | Hair (`Custom/Hair`). `add_hair_item` matches an installed hair item by uid == path, then `dynamicRuntimeLoadPath`, then unique display name, waits for the person's hair state to settle, and toggles it with `SetActiveHairItem` (the hair *creator* flow is the hair-author editor and never adds anything) |
 
 ## Pose / expression
 

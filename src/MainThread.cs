@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Threading;
+using UnityEngine;
 
 namespace VaMMCP {
 	/// <summary>
@@ -35,8 +36,15 @@ namespace VaMMCP {
 			}
 		}
 
-		/// <summary>Run f on the main thread and block the caller until it completes.</summary>
+		/// <summary>Run f on the main thread and block the caller until it completes.
+		/// If the caller IS the main thread (a tool handler nesting another Mt.Run
+		/// inside the drain of the dispatcher), the queue can never drain while the
+		/// outer token blocks - that measured as a hard 10 s timeout on trigger Fire.
+		/// In that case run inline instead.</summary>
 		public T Run<T>(Func<T> f, int timeoutMs = 30000) {
+			if (Plugin.mainThreadId != 0 && Thread.CurrentThread.ManagedThreadId == Plugin.mainThreadId) {
+				return f();
+			}
 			Exception error = null;
 			T result = default(T);
 			ManualResetEvent done = new ManualResetEvent(false);

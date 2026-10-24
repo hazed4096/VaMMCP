@@ -145,8 +145,9 @@ namespace VaMMCP.Mcp {
 
 			JSONNode outNode;
 			try {
-				// Tools that poll for async results must run on the caller thread (they use Mt.Run internally).
-				outNode = tool.NeedsPoller
+				// Tools that poll for async results must run on the caller thread (they use Mt.Run internally);
+				// Worker tools are pure disk samplers and would otherwise block the dispatcher for their whole window.
+				outNode = (tool.NeedsPoller || tool.RunOnWorker)
 					? tool.Handler(args)
 					: mt.Run(() => tool.Handler(args), tool.TimeoutMs);
 			} catch (ApiError ae) {

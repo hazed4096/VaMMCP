@@ -3,13 +3,18 @@ using System.Collections.Generic;
 using SimpleJSON;
 
 namespace VaMMCP.Mcp {
-	/// <summary>One MCP tool: schema + handler. Handlers run on the VaM main thread.</summary>
+	/// <summary>One MCP tool: schema + handler. Handlers run on the VaM main thread
+	/// by default; see RunOnWorker for the pure-disk exception.</summary>
 	public class Tool {
 		public string Name;
 		public string Description;
 		public int TimeoutMs = 30000;
 		/// <summary>True if the handler itself must run on the HTTP thread (it uses MainThreadDispatcher.Run internally).</summary>
 		public bool NeedsPoller;
+		/// <summary>True if the handler must NOT block the main-thread dispatcher for its whole
+		/// duration. Pure file-system tools (performance_profile; it samples Plugin.frameTick
+		/// live and would otherwise freeze Update and observe its own stall) run here.</summary>
+		public bool RunOnWorker;
 		public Func<JSONNode, JSONNode> Handler;
 
 		private readonly List<ParamDef> props = new List<ParamDef>();
@@ -34,6 +39,11 @@ namespace VaMMCP.Mcp {
 
 		public Tool Poller() {
 			NeedsPoller = true;
+			return this;
+		}
+
+		public Tool Worker() {
+			RunOnWorker = true;
 			return this;
 		}
 

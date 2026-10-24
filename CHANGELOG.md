@@ -7,15 +7,65 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
-- **URL parameter support across `list_storable_params` / `get_param` / `set_param`.**
+- **Keep-alive for an unfocused, maximised VaM window on a second virtual
+  desktop.** Exclusive fullscreen pauses Unity's player loop on focus loss
+  (verified: no `Update()` ticks while unfocused), which stopped every
+  main-thread tool. The launch script now starts VaM windowed
+  (`-screen-fullscreen 0`) and the plugin re-asserts `runInBackground` every
+  frame, so the loop keeps ticking; IdleSaver then correctly caps the unfocused
+  VaM to its idle/minimised FPS instead of the GPU burning at full speed.
+- **`performance_profile` is now a worker tool** (new `Tool.RunOnWorker` flag):
+  it previously ran through the main-thread dispatcher and blocked exactly the
+  loop it was sampling, so it always measured 0 frames. It now samples from the
+  worker thread; verified 20 frames / 4 s (5 fps idle) with VaM unfocused.
+- **`create_animation_step` reports the real step uid.** VaM renames the
+  AnimationStep atom when it is attached to a pattern (e.g. `AnimationStep` ->
+  `MCP Test PatternStep1`); the tool re-reads the uid after attach instead of
+  returning the pre-attach name.
+- **`physics_object_action AddForce` semantics**: `value` is the impulse
+  magnitude (numeric), default direction +Y; a vector string parses as 0, so a
+  length is the only safe input. Confirmed live on a Cube (`mass` 2.5, `drag`
+  0.1, `"[0, 5, 0]"`).
+- URL parameter support across `list_storable_params` / `get_param` /
+  `set_param`
+
+### Fixed
+- **`add_hair_item` now works.** It used to drive the runtime hair *creator*
+  (`HairCreator` -> `DAZRuntimeCreator.LoadFromPath`), which silently loaded
+  nothing (that flow is the hair AUTHOR editor; the creator item's `ready` never
+  flips without a `Person > Hair` tab open + bundled meta). The tool now finds
+  the matching item in the person's registered hair library (`uid` == path, then
+  `dynamicRuntimeLoadPath`, then unique display name) and calls
+  `SetActiveHairItem(target, true)` - exactly what the Person > Hair UI does.
+  Verified: `{"added":"ddaamm.hair_long12.3:/.../long12 base.vam","active":true}`
+  and `list_hair_items` shows it active.
+- **A still-building person no longer swallows the hair add.** A fresh Person
+  runs a final async restore pass after creation that rewrites hair toggles
+  (default hair on, everything else off), so anything toggled earlier is
+  silently reverted. `add_hair_item` first waits for the hair-item set to
+  settle (`WaitForHairStable`: snapshot of uid/active/ready unchanged for 3 s,
+  minimum 8 s, no active item still loading).
+- **`add_hair_item` no longer stalls VaM.** It used to poll/sleep inside the
+  main-thread dispatch, freezing every `Update()` while it waited; the polling
+  now happens on the worker thread and only hops to the main thread for the
+  atom reads/writes.
+- **Nested `Mt.Run` deadlock fixed.** A main-thread tool handler that nested
+  `Mt.Run` (e.g. `TriggerAction` Fire -> `GetComponentInChildren<Button>`)
+  enqueued a token that could only drain on the NEXT main-thread frame - which
+  never came while the outer drain ran - and hung until the 10 s timeout.
+  `MainThreadDispatcher.Run` now executes inline when the caller is already on
+  the main thread (`Plugin.mainThreadId`, captured in `Awake`). Verified:
+  `Fire` (`UI.Button.onClick`) returns instantly.
+
+- URL parameter support across `list_storable_params` / `get_param` / `set_param`.
   Url params (VaM's `JSONStorableUrl`, e.g. the `customTexture_MainTex` /
   `customTexture_AlphaTex` texture slots on clothing materials) were invisible and could
   not be written, which blocked any texture-based customisation. `list_storable_params`
   now reports a `urls` section, `get_param` reads them, `set_param` sets them with
   `type:"url"` (auto-detected; pass `reload=false` to skip reloading an unchanged path).
 - `press_key` tool: sends a real key press to VaM (Escape dismisses modal prompts such as the
-  save-screenshot dialog). It brings the VaM window to the foreground first and refuses to send
-  if it could not confirm VaM holds focus, so a stray key cannot land in another application.
+  save-screenshot dialog). It refuses to send if it cannot confirm VaM holds focus, so a
+  stray key cannot land in another application; `focus=true` opts in to raising the window.
 
 ### Fixed
 - **`press_key` no longer steals focus.** The default was to raise the VaM window
