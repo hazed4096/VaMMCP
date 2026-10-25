@@ -40,7 +40,7 @@ VaM runtime status: plugin version, VaM version, atom/person counts, endpoint, e
 | Tool | Arguments | Notes |
 | --- | --- | --- |
 | `add_person` | `uid?` | Add a Person (VaM may rename the uid — trust the return value) |
-| `list_persons` | — | Persons in the scene (uid/character/gender/position) |
+| `list_persons` | — | Persons in the scene (uid/character/gender/position) plus worn clothing (`worn` display names + `wornCount`) — spot a swapped person still wearing its source look's outfit |
 | `list_looks` | `search?` | Appearance presets (`Saves/Person/Appearance`) |
 | `load_look` | `path`*, `person?` | Apply an appearance preset (character/clothing/hair/morph deltas; asynchronous, verify a moment later) |
 | `save_look` | `path?`, `person?` | Export an appearance preset (**note**: VaM presets do not carry the full material parameter set — re-apply skin parameters after moving a look between scenes) |
@@ -135,7 +135,7 @@ VaM runtime status: plugin version, VaM version, atom/person counts, endpoint, e
 | `list_animation_steps` | `pattern_uid`? | Steps of a pattern (some steps report no linkage param — see note in response) |
 | `animation_pattern_action` / `animation_step_action` | `pattern_uid`/`step_uid`*, `action`*, `value?` | Play/Stop/… actions; `Step SetTransition` takes seconds → `transitionToTime` (numeric) or a transition-type chooser word |
 | `record_scene_animation` | `pattern_uid`*, `action`* (start/stop) | Errors helpfully: VaM's built-in controller recording is UI-only (no Record action on the pattern) |
-| `list_audio_clips` | `type?` (all/embedded/url), `category?`, `search?` | Enumerate VaM's registered audio clips (embedded package audio like FemaleBreath/Music/SoundFX + URL clips) with categories. Returned `uid`s work directly as `audio_source_action` Play/SetClip clip values; `category` matches case-insensitively (verified: 332 embedded clips across 11 categories on a fresh boot) |
+| `list_audio_clips` | `type?` (all/embedded/url), `category?`, `search?` | Enumerate VaM's registered audio clips (embedded package audio like FemaleBreath/Music/SoundFX + URL clips) with categories. URL clips also report `ready` (+ `error` on load failure) — Play against a not-ready clip refuses with a retry hint. Returned `uid`s work directly as `audio_source_action` Play/SetClip clip values; `category` matches case-insensitively (verified: 332 embedded clips across 11 categories on a fresh boot) |
 | `create_audio_source` / `list_audio_sources` / `audio_source_action` | `audio_source_action`: `uid`*, `action`*, `clip?`/`value?` | Actions: SetClip, Play, PlayLoop, Pause, UnPause, Stop, SetVolume, SetLoop, … . `SetClip` decodes local PCM WAVs in-plugin (16-bit/float32); ogg/mp3 fall back to VaM's URL clip queue, which may stay `ready=false` until the Sound tab is opened. `Play`/`PlayLoop` reuse the last `SetClip`; `list_audio_sources` shows `playingClip`. `Play` also resolves embedded clips now (verified live with a Music clip) |
 | `physics_object_action` | `uid`*, `action`*, `value`/`direction?` | Rigidbody on the atom's mainController GameObject (auto-added when missing): `SetMass`, `SetDrag`, `AddForce` (impulse magnitude, default +Y; the sim must be awake — IdleSaver freezing stops motion) |
 

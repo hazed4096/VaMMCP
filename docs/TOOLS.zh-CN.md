@@ -39,7 +39,7 @@ VaM 运行时状态：插件版本、VaM 版本、原子/人物数量、端点�
 | 工具 | 参数 | 说明 |
 | --- | --- | --- |
 | `add_person` | `uid?` | 添加人物（uid 可能被 VaM 重命名，以返回值为准） |
-| `list_persons` | — | 人物列表（uid/角色名/性别/位置） |
+| `list_persons` | — | 人物列表（uid/角色名/性别/位置），并附每人的已穿服装（`worn` 显示名 + `wornCount`）——用于发现换角色后仍穿着原来源 outfit 的人 |
 | `list_looks` | `search?` | 外观预设列表（`Saves/Person/Appearance`） |
 | `load_look` | `path`*, `person?` | 应用外观预设（角色/服装/发型/morph 增量；异步，稍后验证） |
 | `save_look` | `path?`, `person?` | 导出外观预设（**注意**：VaM 的预设保存不含完整材质参数，跨场景搬运后需按需补设皮肤参数） |
@@ -132,7 +132,7 @@ VaM 运行时状态：插件版本、VaM 版本、原子/人物数量、端点�
 | `list_animation_steps` | `pattern_uid`? | 某模式的步骤（部分步骤不暴露链接参数，见返回提示） |
 | `animation_pattern_action` / `animation_step_action` | `pattern_uid`/`step_uid`*, `action`*, `value?` | Play/Stop/… 动作；`Step SetTransition` 数值=秒（写 `transitionToTime`），字符串=过渡类型选择 |
 | `record_scene_animation` | `pattern_uid`*, `action`* (start/stop) | 会给出解释错误：VaM 自带控制器录制仅 UI 可用（pattern 无 Record 动作） |
-| `list_audio_clips` | `type?` (all/embedded/url), `category?`, `search?` | 枚举 VaM 已注册的音频（内嵌包音频如 FemaleBreath/Music/SoundFX + URL 剪辑），按类别分组。返回的 `uid` 可直接作为 `audio_source_action` Play/SetClip 的 clip；`category` 大小写不敏感（验证：新启动 332 条内嵌剪辑、11 类） |
+| `list_audio_clips` | `type?` (all/embedded/url), `category?`, `search?` | 枚举 VaM 已注册的音频（内嵌包音频如 FemaleBreath/Music/SoundFX + URL 剪辑），按类别分组。URL 剪辑还带 `ready`（加载失败时 `error`）——对未就绪剪辑调用 Play 会拒绝并提示稍后重试。返回的 `uid` 可直接作为 `audio_source_action` Play/SetClip 的 clip；`category` 大小写不敏感（验证：新启动 332 条内嵌剪辑、11 类） |
 | `create_audio_source` / `list_audio_sources` / `audio_source_action` | `audio_source_action`: `uid`*, `action`*, `clip?`/`value?` | 动作：SetClip, Play, PlayLoop, Pause, UnPause, Stop, SetVolume, SetLoop 等。`SetClip` 插件内直接解码本地 PCM WAV（16bit/float32）；ogg/mp3 走 VaM URL 队列，Sound 页签未打开前可能一直 `ready=false`。`Play`/`PlayLoop` 复用上次 `SetClip`；`list_audio_sources` 显示 `playingClip`。`Play` 现在也能解析内嵌剪辑（已实测 Music 剪辑） |
 | `physics_object_action` | `uid`*, `action`*, `value`/`direction?` | mainController GameObject 上的 Rigidbody（缺失会自动加）：`SetMass`、`SetDrag`、`AddForce`（冲量幅值，默认 +Y；模拟必须醒着——IdleSaver 冻结时不动） |
 

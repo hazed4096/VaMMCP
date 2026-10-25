@@ -7,6 +7,18 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **`list_persons` reports worn clothing.** Each person row now carries
+  `wornCount` and `worn` (display names of active clothing items, excluding the
+  runtime clothing creator) - built from `sel.clothingItems`/`active`, the same
+  source as `list_clothing_items`. Purpose: catch a character-swapped person
+  that still wears its source look's outfit. Verified live: girls stripped to
+  0 while the male reports 2 and the Nurse Futa 8, values stable across a
+  scene reload.
+- **`list_audio_clips` reports URL-clip load state.** URL section rows now
+  carry `ready` (bool) and `error` (when the queued load failed), so a silent
+  trigger fired against a still-loading package WAV is diagnosable without
+  playing into a refusal. Verified live across a reload: all 15 queued machine
+  WAVs flip from ready:false to ready:true as the queue drains.
 - **`list_audio_clips` (new tool).** Enumerates VaM's registered audio clips -
   `EmbeddedAudioClipManager.singleton` and `URLAudioClipManager.singleton`
   (public `GetCategories`/`GetCategoryClips`, decompile lines 263863+), grouped

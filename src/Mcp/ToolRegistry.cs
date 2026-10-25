@@ -74,7 +74,7 @@ namespace VaMMCP.Mcp {
 				.P("uid", "string", "Optional uid (default auto)", false)
 				.Timeout(90000).Poller()
 				.Fn(api.AddPerson));
-			tools.Add(new Tool("list_persons", "List Person atoms: uid, character, gender, on/off, position.")
+			tools.Add(new Tool("list_persons", "List Person atoms: uid, character, gender, on/off, position, worn clothing (worn/wornCount - include to spot a swapped person still wearing its source outfit).")
 				.Fn(a => api.ListPersons()));
 			tools.Add(new Tool("list_looks", "List appearance presets (looks) on disk.")
 				.P("search", "string", "Optional substring filter", false)

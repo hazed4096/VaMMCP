@@ -728,6 +728,25 @@ namespace VaMMCP.Api {
 					}
 					row["character"] = character;
 					row["gender"] = sel.gender.ToString();
+					// worn clothing summary so a swapped person that still wears its
+					// source look's outfit is visible at a glance
+					JSONArray worn = new JSONArray();
+					int wornCount = 0;
+					try {
+						DAZClothingItem creator = CreatorFor(sel);
+						DAZClothingItem[] items = sel.clothingItems;
+						if (items != null) {
+							foreach (DAZClothingItem it in items) {
+								if (it == null) continue;
+								if (creator != null && (object)it == (object)creator) continue;
+								if (!it.active) continue;
+								wornCount++;
+								worn.Add(it.displayName != null ? it.displayName : it.uid);
+							}
+						}
+					} catch { }
+					row["wornCount"] = JSONRaw.Num(wornCount);
+					row["worn"] = worn;
 				} catch { }
 				arr.Add(row);
 			}
@@ -3340,6 +3359,12 @@ namespace VaMMCP.Api {
 						JSONClass clipj = new JSONClass();
 						clipj["uid"] = n.uid != null ? n.uid : "";
 						clipj["name"] = n.displayName != null ? n.displayName : "";
+						URLAudioClip urlClip = n as URLAudioClip;
+						if (urlClip != null) {
+							clipj["ready"] = JSONRaw.Bool(urlClip.ready);
+							if (urlClip.error && urlClip.errorMsg != null && urlClip.errorMsg != "")
+								clipj["error"] = urlClip.errorMsg;
+						}
 						clips.Add(clipj);
 						total++;
 					}
