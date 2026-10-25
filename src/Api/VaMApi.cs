@@ -1741,6 +1741,77 @@ namespace VaMMCP.Api {
 			return r;
 		}
 
+		/// <summary>Teleport a person's whole figure to a world position/rotation in one step:
+		/// capture the person's collision bool params, turn them off so limbs cannot catch on
+		/// moving geometry, then move EVERY pinned FreeControllerV3 of the person rigidly with
+		/// the hip (translate by the hip delta + rotate around the hip by the hip rotation
+		/// change - physics-driven/off controls are left for the sim to re-derive), restore the
+		/// captured collision values and optionally (default true) reset the simulation so
+		/// cloth/soft bodies re-derive clean. No tweening: the figure jumps intact.</summary>
+		public JSONNode PersonTeleport(JSONNode args) {
+			Atom p = RequirePerson(S(args, "person"));
+			if (!Has(args, "position")) throw new ApiError("position required [x,y,z]");
+			Vector3 pos = ParseVec3(args["position"]);
+			bool reset = !Has(args, "reset") || Bool(args, "reset", true);
+			FreeControllerV3 hip = GetControl(p, "hipControl");
+			JSONClass r = new JSONClass();
+			r["person"] = p.uid;
+			r["from"] = Vec(hip.control.position);
+			// capture every collision-ish bool param and switch it off
+			List<JSONStorable> colSt = new List<JSONStorable>();
+			List<string> colName = new List<string>();
+			List<bool> colVal = new List<bool>();
+			foreach (string sid in p.GetStorableIDs()) {
+				JSONStorable st = p.GetStorableByID(sid);
+				if (st == null) continue;
+				string bp = MatchBoolParam(st, "collision");
+				if (bp == null) continue;
+				try {
+					colVal.Add(st.GetBoolParamValue(bp));
+					st.SetBoolParamValue(bp, false);
+					colSt.Add(st);
+					colName.Add(bp);
+				} catch (Exception e) { r["collisionSkip." + sid] = e.Message; }
+			}
+			r["collisionOff"] = JSONRaw.Num(colSt.Count);
+			// rigid move of the pinned control set with the hip
+			Vector3 prevPos = hip.control.position;
+			Quaternion prevRotQ = hip.control.rotation;
+			Quaternion dRotor = Quaternion.Euler(Has(args, "rotation") ? ParseVec3(args["rotation"]) : Vector3.zero) * Quaternion.Inverse(prevRotQ);
+			if (!Has(args, "rotation")) dRotor = Quaternion.identity;
+			int moved = 0, kept = 0;
+			List<string> ctrlNames = SC.GetFreeControllerNamesInAtom(p.uid);
+			foreach (string name in ctrlNames) {
+				JSONStorable st = p.GetStorableByID(name);
+				FreeControllerV3 fc = st as FreeControllerV3;
+				if (fc == null) continue;
+				if (fc.currentPositionState != FreeControllerV3.PositionState.On) { kept++; continue; }
+				Vector3 rel = fc.control.position - prevPos;
+				fc.transform.position = pos + (Has(args, "rotation") ? dRotor * rel : rel);
+				if (fc.currentRotationState == FreeControllerV3.RotationState.On) {
+					fc.transform.rotation = Has(args, "rotation") ? dRotor * fc.control.rotation : fc.control.rotation;
+				}
+				moved++;
+			}
+			r["controlsMoved"] = JSONRaw.Num(moved);
+			r["controlsSkippedOff"] = JSONRaw.Num(kept);
+			r["to"] = Vec(hip.control.position);
+			if (moved == 0 || hip.currentPositionState != FreeControllerV3.PositionState.On) {
+				r["hipNote"] = "pinned-control pass left the hip unwritten; wrote hip via SetPositionNoForce fallback";
+				hip.SetPositionNoForce(pos);
+				if (Has(args, "rotation")) hip.SetRotationNoForce(ParseVec3(args["rotation"]));
+				r["to"] = Vec(hip.control.position);
+			}
+			// restore the captured collision values exactly
+			int restored = 0;
+			for (int i = 0; i < colSt.Count; i++) {
+				try { colSt[i].SetBoolParamValue(colName[i], colVal[i]); restored++; } catch { }
+			}
+			r["collisionRestored"] = JSONRaw.Num(restored);
+			if (reset) r["resetSimulation"] = ResetSimulation();
+			return r;
+		}
+
 		private static object ParseEnum(Type enumType, string name) {
 			foreach (string n in Enum.GetNames(enumType)) {
 				if (string.Equals(n, name, StringComparison.OrdinalIgnoreCase)) return Enum.Parse(enumType, n);

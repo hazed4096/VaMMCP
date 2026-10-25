@@ -226,6 +226,12 @@ namespace VaMMCP.Mcp {
 				.P("position", "array", "[x, y, z] world position", false)
 				.P("rotation", "array", "[x, y, z] euler angles", false)
 				.Fn(api.ControlPose));
+			tools.Add(new Tool("person_teleport", "Teleport a person's whole figure instantly: person collision params captured+off, hipControl written without force (no tweening), previous state choosers restored, collision values restored, optional core ResetSimulation so cloth/soft bodies re-derive from the new spot.")
+				.P("person", "string", "Person uid (default: first Person)", false)
+				.P("position", "array", "[x, y, z] world position for hipControl", true)
+				.P("rotation", "array", "[x, y, z] euler angles (omit to keep current)", false)
+				.P("reset", "bool", "reset simulation after the jump (default true; needs ~10 s)", false)
+				.Fn(api.PersonTeleport));
 			tools.Add(new Tool("set_gaze", "Adjust a person's gaze via the lookAt storable (best effort; inspect with list_storable_params storable=lookAt for the full param list).")
 				.P("person", "string", "Person uid (default: first Person)", false)
 				.P("amount", "number", "gazeAmount 0..1 (optional)", false)
