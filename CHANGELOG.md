@@ -7,6 +7,17 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **`aim_camera` (new tool).** Rotates the monitor camera to look at a target
+  without touching position (or moves it first via `position`). Target is any
+  atom `uid` (zero-transform subscene atoms fall back to their `control`
+  FreeControllerV3) or `person` + optional `control` (default `hipControl`).
+  Motivation: hand-computing Unity yaw for a look-at took multiple capture
+  round-trips and yaw-180 views are mirrored (screen-right = -X). Verified
+  live: aimed at Girl2's hip after a scene reload and she landed dead-center
+  in the capture on the first shot.
+- **`get_control` reports controller states.** Responses now include
+  `positionState`/`rotationState`, so agents can see whether a control is
+  On/Off/Follow/Hold before writing to it.
 - **`list_persons` reports worn clothing.** Each person row now carries
   `wornCount` and `worn` (display names of active clothing items, excluding the
   runtime clothing creator) - built from `sel.clothingItems`/`active`, the same

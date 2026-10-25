@@ -1680,6 +1680,8 @@ namespace VaMMCP.Api {
 			r["control"] = controlId;
 			r["position"] = Vec(fc.control.position);
 			r["rotation"] = Vec(fc.control.eulerAngles);
+			r["positionState"] = fc.currentPositionState.ToString();
+			r["rotationState"] = fc.currentRotationState.ToString();
 			return r;
 		}
 
@@ -2273,6 +2275,49 @@ namespace VaMMCP.Api {
 			if (Has(args, "rotation")) cam.transform.rotation = Quaternion.Euler(ParseVec3(args["rotation"]));
 			if (Has(args, "fov")) cam.fieldOfView = Num(args, "fov", 60f);
 			return GetCamera();
+		}
+
+		/// <summary>
+		/// Rotate the monitor camera so it looks at a target (atom, person, or a person's
+		/// named control) without touching its position or FOV. Solves the recurring
+		/// hand-computed-yaw trap around Unity's mirrored look directions. Optional
+		/// "position" arg first moves the camera (same shape as set_camera), so
+		/// aim_camera can be a one-shot "put the camera here and look there".
+		/// </summary>
+		public JSONNode AimCamera(JSONNode args) {
+			Vector3 target = ResolveTargetPoint(args);
+			Camera cam = MonitorCamera();
+			JSONClass res = new JSONClass();
+			if (Has(args, "position")) cam.transform.position = ParseVec3(args["position"]);
+			if (Has(args, "fov")) cam.fieldOfView = Num(args, "fov", cam.fieldOfView);
+			cam.transform.rotation = Quaternion.LookRotation(target - cam.transform.position, Vector3.up);
+			res["aimedAt"] = Vec(target);
+			res["camera"] = GetCamera();
+			return res;
+		}
+
+		/// <summary>World position of an aim target: "uid" (any atom; falls back to its
+		/// FreeControllerV3 "control" when the transform is zero, e.g. subscene atoms),
+		/// or "person" + optional "control" (defaults to hipControl).</summary>
+		private Vector3 ResolveTargetPoint(JSONNode args) {
+			string person = S(args, "person");
+			if (person != "") {
+				Atom p = RequirePerson(person);
+				string controlId = S(args, "control");
+				if (controlId == "") controlId = "hipControl";
+				return GetControl(p, controlId).control.position;
+			}
+			string uid = S(args, "uid");
+			if (uid == "") throw new ApiError("aim target required: provide 'uid' or 'person'");
+			Atom atom = SuperController.singleton.GetAtomByUid(uid);
+			if (atom == null) throw new ApiError("atom not found: " + uid);
+			Vector3 pos = atom.transform.position;
+			if (pos.sqrMagnitude < 0.000001f) {
+				FreeControllerV3 fc = atom.GetStorableByID("control") as FreeControllerV3;
+				if (fc != null && fc.control.position.sqrMagnitude > 0.000001f) return fc.control.position;
+				throw new ApiError("atom " + uid + " reports a zero transform (subscene atoms do); no 'control' fallback available");
+			}
+			return pos;
 		}
 
 		/// <summary>Largest PNG returned inline as base64 (bigger images stay on disk only).</summary>

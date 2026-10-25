@@ -112,6 +112,7 @@ VaM 运行时状态：插件版本、VaM 版本、原子/人物数量、端点�
 | --- | --- | --- |
 | `get_camera` | — | 监视器相机位置/旋转/FOV |
 | `set_camera` | `position?`, `rotation?`, `fov?` | 移动相机 |
+| `aim_camera` | `uid?` / `person?` + `control?`、`position?`、`fov?` | 让相机对准目标（不动位置；也可用 `position` 先移动）。目标：任意 atom `uid`，或 `person`（+ control，默认 `hipControl`）。解决手算 yaw 的坑——Unity yaw-180 视角是镜像的（屏幕右 = -X） |
 | `capture_view` | `width?`, `height?`, `path?`, `return_image?`, `mode?`, `timeout_ms?` | 渲染截图（默认 `Saves/PluginData/vam-mcp/preview.png`）。`mode=window`（默认）抓真实后备缓冲，人物皮肤/衣服渲染正确（等待下一帧；空闲省电类插件可能拖慢）。**已知限制：某些启动下 window 抓取即使 VaM 活动也返回全黑——此时用 `mode=camera`。** `mode=camera` 快速从监视器相机重渲染；能渲染真实场景（已验证：相机移动+环境+Hub 面板），但人物网格可能变黑。`return_image=true` 时同时以 MCP image 块返回 PNG——分辨率别开太大（如 640×360），超过 4 MB 只落盘不内联。肤色/衣服颜色仍以 VaM 窗口目视为准，截图仅供参考 |
 
 ## 模拟

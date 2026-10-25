@@ -267,6 +267,13 @@ namespace VaMMCP.Mcp {
 				.P("rotation", "array", "[x, y, z] euler angles", false)
 				.P("fov", "number", "Field of view in degrees", false)
 				.Fn(api.SetCamera));
+			tools.Add(new Tool("aim_camera", "Rotate the monitor camera to look at a target without moving it (solves Unity's hand-computed-yaw trap; note yaw 180 views are mirrored: screen-right = -X). Optionally also set position first. Target: 'uid' of any atom (zero-transform subscene atoms fall back to their 'control' FreeControllerV3), or 'person' + optional 'control' (defaults hipControl).")
+				.P("uid", "string", "Atom uid to look at", false)
+				.P("person", "string", "Person uid to look at", false)
+				.P("control", "string", "Control id of the person (default hipControl)", false)
+				.P("position", "array", "Optional new camera position before aiming", false)
+				.P("fov", "number", "Optional FOV (default: keep current)", false)
+				.Fn(api.AimCamera));
 			tools.Add(new Tool("capture_view", "Capture what VaM actually renders on screen to a PNG (default Saves/PluginData/vam-mcp/preview.png) and return its path. mode=window (default) grabs the real back buffer, so person skin/clothing render; it completes at end of the next frame, so the tool polls (up to timeout_ms - idle VaM frames can take seconds). mode=camera does the old RenderTexture re-render of the monitor camera only (fast, but person meshes may be missing). Set return_image=true to also get the picture back inline.")
 				.P("width", "number", "Image width (default 1280, max 4096; window mode scales the full buffer down to this)", false)
 				.P("height", "number", "Image height (default 720, max 4096)", false)

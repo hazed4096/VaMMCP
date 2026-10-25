@@ -11,7 +11,7 @@ namespace VaMMCP.Mcp {
 	public class McpServer {
 		private const string ProtocolVersion = "2025-06-18";
 		public const string ServerName = "VaMMCP";
-		public const string ServerVersion = "1.0.1";
+		public const string ServerVersion = "1.1.0";
 
 		private readonly MainThreadDispatcher mt;
 		private readonly List<Tool> tools;

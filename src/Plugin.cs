@@ -5,7 +5,7 @@ using UnityEngine;
 using VaMMCP.Mcp;
 
 namespace VaMMCP {
-	[BepInPlugin("com.vammcp.core", "VaMMCP", "1.0.1")]
+	[BepInPlugin("com.vammcp.core", "VaMMCP", "1.1.0")]
 	public class Plugin : BaseUnityPlugin {
 		public static Plugin instance;
 		/// <summary>ManagedThreadId of the Unity main thread, captured in Awake so the

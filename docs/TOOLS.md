@@ -115,6 +115,7 @@ VaM runtime status: plugin version, VaM version, atom/person counts, endpoint, e
 | --- | --- | --- |
 | `get_camera` | — | Monitor camera position / rotation / FOV |
 | `set_camera` | `position?`, `rotation?`, `fov?` | Move the camera |
+| `aim_camera` | `uid?` / `person?` + `control?`, `position?`, `fov?` | Rotate the camera to look at a target without touching position (or move it first with `position`). Target: any atom `uid`, or `person` (+ control, default `hipControl`). Solves the hand-computed-yaw trap — Unity yaw-180 views are mirrored (screen-right = -X) |
 | `capture_view` | `width?`, `height?`, `path?`, `return_image?`, `mode?`, `timeout_ms?` | Screenshot (default `Saves/PluginData/vam-mcp/preview.png`). `mode=window` (default) grabs the real back buffer so person skin/clothing render correctly (polls until the next frame; TailSaver-style idle can make it slow). **Known limitation: on some boots the window grab returns an all-black buffer even while VaM is active — if so use `mode=camera`.** `mode=camera` does the fast RenderTexture re-render of the monitor camera; it renders the real scene (verified: camera moves + environment + Hub panels) but person meshes may come out black in it. With `return_image=true` the PNG also comes back as an MCP image block — keep the resolution modest (e.g. 640×360); anything above 4 MB stays on disk only. Note: applying skin/clothing colours is still verified best in the VaM window, captures are indicative |
 
 ## Simulation
