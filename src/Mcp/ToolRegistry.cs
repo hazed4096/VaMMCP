@@ -363,7 +363,12 @@ namespace VaMMCP.Mcp {
 				.Fn(api.LightAction));
 			tools.Add(new Tool("list_audio_sources", "List AudioSource atoms.")
 				.Fn(api.ListAudioSources));
-			tools.Add(new Tool("audio_source_action", "Control AudioSource: Play, Stop, Pause, SetVolume, SetClip, SetLoop.")
+			tools.Add(new Tool("list_audio_clips", "List VaM's registered audio clips (embedded package audio + URL clips) with categories; uids work directly as audio_source_action Play clip.")
+				.P("type", "string", "all|embedded|url (default all)", false)
+				.P("category", "string", "Case-insensitive category name filter", false)
+				.P("search", "string", "Substring filter on clip uid/name", false)
+				.Fn(api.ListAudioClips));
+			tools.Add(new Tool("audio_source_action", "Control AudioSource: Play, Stop, Pause, SetClip (also decodes local PCM WAV in-plugin), SetLoop, SetVolume.")
 				.P("uid", "string", "AudioSource atom uid", true)
 				.P("action", "string", "Action: Play, Stop, Pause, SetVolume, SetClip, SetLoop", true)
 				.P("value", "any", "Value for the action", false)
@@ -389,10 +394,10 @@ namespace VaMMCP.Mcp {
 				.Fn(api.TemplateBrowser));
 
 			// ---------- atom UI (control, move, geometry, physics) ----------
-			tools.Add(new Tool("atom_control", "Control atom state: IsolateEdit, FreezePhysics, DisableRender, DisableCollision, Select, EndIsolate.")
+			tools.Add(new Tool("atom_control", "Control atom state: Select, FreezePhysics, DisableRender, DisableCollision, EndIsolate, LoadUserDefaults (apply the atom's user-default preset).")
 				.P("uid", "string", "Atom uid", true)
-				.P("action", "string", "Action: IsolateEdit, FreezePhysics, DisableRender, DisableCollision, Select, EndIsolate, SetNameSpace", true)
-				.P("value", "any", "Value for SetNameSpace", false)
+				.P("action", "string", "Action: Select, FreezePhysics, DisableCollision, EndIsolate, LoadUserDefaults, ...", true)
+				.P("value", "any", "Optional value (e.g. value=false on FreezePhysics to unfreeze)", false)
 				.Fn(api.AtomControl));
 			tools.Add(new Tool("atom_move", "Move atom with gizmo: SetPosition, SetRotation, SetScale, SnapToGround, AlignTo.")
 				.P("uid", "string", "Atom uid", true)

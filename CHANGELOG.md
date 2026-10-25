@@ -7,6 +7,24 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **`list_audio_clips` (new tool).** Enumerates VaM's registered audio clips -
+  `EmbeddedAudioClipManager.singleton` and `URLAudioClipManager.singleton`
+  (public `GetCategories`/`GetCategoryClips`, decompile lines 263863+), grouped
+  by category with `type` (all/embedded/url), case-insensitive `category` and
+  `search` filters. The returned uids feed straight into `audio_source_action`
+  Play/SetClip. Verified live: 332 embedded clips across 11 categories on a
+  fresh boot; search/category filters; url section empty cleanly; bad type
+  errors clearly.
+- **`audio_source_action Play` resolves embedded clips.** `FindRegisteredClip`
+  now falls back to `EmbeddedAudioClipManager` after the URL manager, so a clip
+  name like `NightlyNewsOrigMix` plays without any Sound-tab visit. Verified
+  live: `Play` -> `playing: NightlyNewsOrigMix` on a test AudioSource atom.
+- **`atom_control LoadUserDefaults`.** Calls the atom's
+  `mainPresetControl.LoadUserDefaults()` - the same call VaM's own add-flow
+  (`AddAtomByType` userInvoked branch, decompile 318782) makes. Applies the
+  user-saved defaults preset when one exists; otherwise a faithful no-op
+  (`loaded:true`, unchanged values - verified on a stock cube, whose defaults
+  store nothing).
 - **Local WAV decode + play via `audio_source_action`.** `SetClip` decodes
   disk PCM WAVs (16-bit or float32) in-plugin (`FileManagerSecure.ReadAllBytes`
   + `AudioClip.Create`/`SetData`) and caches them, because VaM's

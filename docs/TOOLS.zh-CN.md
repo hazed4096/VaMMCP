@@ -112,7 +112,7 @@ VaM 运行时状态：插件版本、VaM 版本、原子/人物数量、端点�
 | --- | --- | --- |
 | `get_camera` | — | 监视器相机位置/旋转/FOV |
 | `set_camera` | `position?`, `rotation?`, `fov?` | 移动相机 |
-| `capture_view` | `width?`, `height?`, `path?`, `return_image?` | 渲染截图（默认 `Saves/PluginData/vam-mcp/preview.png`）。`return_image=true` 时同时以 MCP image 块返回 PNG，读不到 VaM 目录的客户端也能"看"到——分辨率别开太大（如 640×360），超过 4 MB 只落盘不内联 |
+| `capture_view` | `width?`, `height?`, `path?`, `return_image?`, `mode?`, `timeout_ms?` | 渲染截图（默认 `Saves/PluginData/vam-mcp/preview.png`）。`mode=window`（默认）抓真实后备缓冲，人物皮肤/衣服渲染正确（等待下一帧；空闲省电类插件可能拖慢）。**已知限制：某些启动下 window 抓取即使 VaM 活动也返回全黑——此时用 `mode=camera`。** `mode=camera` 快速从监视器相机重渲染；能渲染真实场景（已验证：相机移动+环境+Hub 面板），但人物网格可能变黑。`return_image=true` 时同时以 MCP image 块返回 PNG——分辨率别开太大（如 640×360），超过 4 MB 只落盘不内联。肤色/衣服颜色仍以 VaM 窗口目视为准，截图仅供参考 |
 
 ## 模拟
 
@@ -132,14 +132,15 @@ VaM 运行时状态：插件版本、VaM 版本、原子/人物数量、端点�
 | `list_animation_steps` | `pattern_uid`? | 某模式的步骤（部分步骤不暴露链接参数，见返回提示） |
 | `animation_pattern_action` / `animation_step_action` | `pattern_uid`/`step_uid`*, `action`*, `value?` | Play/Stop/… 动作；`Step SetTransition` 数值=秒（写 `transitionToTime`），字符串=过渡类型选择 |
 | `record_scene_animation` | `pattern_uid`*, `action`* (start/stop) | 会给出解释错误：VaM 自带控制器录制仅 UI 可用（pattern 无 Record 动作） |
-| `create_audio_source` / `list_audio_sources` / `audio_source_action` | `audio_source_action`: `uid`*, `action`*, `clip?`/`value?` | 动作：SetClip, Play, PlayLoop, Pause, UnPause, Stop, SetVolume, SetLoop 等。`SetClip` 插件内直接解码本地 PCM WAV（16bit/float32）；ogg/mp3 走 VaM URL 队列，Sound 页签未打开前可能一直 `ready=false`。`Play`/`PlayLoop` 复用上次 `SetClip`；`list_audio_sources` 显示 `playingClip` |
+| `list_audio_clips` | `type?` (all/embedded/url), `category?`, `search?` | 枚举 VaM 已注册的音频（内嵌包音频如 FemaleBreath/Music/SoundFX + URL 剪辑），按类别分组。返回的 `uid` 可直接作为 `audio_source_action` Play/SetClip 的 clip；`category` 大小写不敏感（验证：新启动 332 条内嵌剪辑、11 类） |
+| `create_audio_source` / `list_audio_sources` / `audio_source_action` | `audio_source_action`: `uid`*, `action`*, `clip?`/`value?` | 动作：SetClip, Play, PlayLoop, Pause, UnPause, Stop, SetVolume, SetLoop 等。`SetClip` 插件内直接解码本地 PCM WAV（16bit/float32）；ogg/mp3 走 VaM URL 队列，Sound 页签未打开前可能一直 `ready=false`。`Play`/`PlayLoop` 复用上次 `SetClip`；`list_audio_sources` 显示 `playingClip`。`Play` 现在也能解析内嵌剪辑（已实测 Music 剪辑） |
 | `physics_object_action` | `uid`*, `action`*, `value`/`direction?` | mainController GameObject 上的 Rigidbody（缺失会自动加）：`SetMass`、`SetDrag`、`AddForce`（冲量幅值，默认 +Y；模拟必须醒着——IdleSaver 冻结时不动） |
 
 ## 原子 UI 辅助
 
 | 工具 | 参数 | 说明 |
 | --- | --- | --- |
-| `atom_control` | `uid`*, `action`*, `value?` | `Select`（SuperController.SelectController 选主控制器）、`FreezePhysics`/`UnfreezePhysics`（控制器位置/旋转状态 Freeze↔Off；`value=false` 解冻）、`DisableCollision`/`EnableCollision`、`DisableRender`/`EnableRender`（映射到原子电源开关）、`EndIsolate`（EndIsolateEditAtom；进入隔离仅 UI） |
+| `atom_control` | `uid`*, `action`*, `value?` | `Select`（SuperController.SelectController 选主控制器）、`FreezePhysics`/`UnfreezePhysics`（控制器位置/旋转状态 Freeze↔Off；`value=false` 解冻）、`DisableCollision`/`EnableCollision`、`DisableRender`/`EnableRender`（映射到原子电源开关）、`EndIsolate`（EndIsolateEditAtom；进入隔离仅 UI）、`LoadUserDefaults`（mainPresetControl.LoadUserDefaults——与 VaM 自己的添加流程相同；仅在存在*用户已保存的默认预设*时生效，否则 `loaded:true` 无变化——已实测普通 Cube） |
 | `atom_move` | `uid`*, `action`*, `value?` | SetPosition/SetRotation/SetScale/SnapToGround/AlignTo/ResetTransform |
 | `atom_geometry_choices` | `uid`*, `action`, `choice?` | 原子几何选项（CustomUnityAsset 等） |
 | `storable_diff` | `uid_a`*, `storable_a`*, `uid_b`*, `storable_b`* | 两个 storable 求差（相同/不同数 + 变化参数） |

@@ -3294,11 +3294,69 @@ namespace VaMMCP.Api {
 			string tail = TailPath(path);
 			if (_ownClips.ContainsKey(path)) return _ownClips[path];
 			if (_ownClips.ContainsKey(tail)) return _ownClips[tail];
-			if (URLAudioClipManager.singleton == null) return null;
-			NamedAudioClip n = URLAudioClipManager.singleton.GetClip(path);
-			if (n == null) n = URLAudioClipManager.singleton.GetClip(tail);
-			return n;
+			if (URLAudioClipManager.singleton != null) {
+				NamedAudioClip n = URLAudioClipManager.singleton.GetClip(path);
+				if (n == null) n = URLAudioClipManager.singleton.GetClip(tail);
+				if (n != null) return n;
+			}
+			if (EmbeddedAudioClipManager.singleton != null) {
+				NamedAudioClip en = EmbeddedAudioClipManager.singleton.GetClip(path);
+				if (en == null) en = EmbeddedAudioClipManager.singleton.GetClip(tail);
+				if (en != null) return en;
+			}
+			return null;
 		}
+
+		/// <summary>Enumerate VaM's embedded + URL audio clip registries (what the Sound UI lists).</summary>
+		public JSONNode ListAudioClips(JSONNode args) {
+			string type = S(args, "type").ToLowerInvariant();
+			if (type == "" || type == "any") type = "all";
+			if (type != "all" && type != "embedded" && type != "url") throw new ApiError("type must be all|embedded|url");
+			string cat = S(args, "category");
+			string search = S(args, "search");
+			if (search != null) search = search.ToLowerInvariant();
+			JSONClass r = new JSONClass();
+			JSONArray sections = new JSONArray();
+			int total = 0;
+			foreach (object pairObj in new object[] { new object[] { "embedded", (AudioClipManager)EmbeddedAudioClipManager.singleton },
+				new object[] { "url", (AudioClipManager)URLAudioClipManager.singleton } }) {
+				object[] pair = (object[])pairObj;
+				string kind = (string)pair[0];
+				AudioClipManager mgr = (AudioClipManager)pair[1];
+				if (mgr == null) continue;
+				if (type != "all" && type != kind) continue;
+				JSONClass sec = new JSONClass();
+				sec["type"] = kind;
+				JSONArray catArr = new JSONArray();
+				foreach (string c in mgr.GetCategories()) {
+					if (cat != "" && c.ToLowerInvariant() != cat.ToLowerInvariant()) continue;
+					JSONClass cj = new JSONClass();
+					JSONArray clips = new JSONArray();
+					foreach (NamedAudioClip n in mgr.GetCategoryClips(c)) {
+						if (n == null || n.destroyed) continue;
+						if (search != null && search != ""
+							&& (n.uid == null || n.uid.ToLowerInvariant().IndexOf(search, StringComparison.Ordinal) < 0)
+							&& (n.displayName == null || n.displayName.ToLowerInvariant().IndexOf(search, StringComparison.Ordinal) < 0)) continue;
+						JSONClass clipj = new JSONClass();
+						clipj["uid"] = n.uid != null ? n.uid : "";
+						clipj["name"] = n.displayName != null ? n.displayName : "";
+						clips.Add(clipj);
+						total++;
+					}
+					if (clips.Count == 0 && (search != null && search != "" || cat != "")) continue;
+					cj["name"] = c;
+					cj["clips"] = clips;
+					catArr.Add(cj);
+				}
+				sec["categories"] = catArr;
+				sections.Add(sec);
+			}
+			r["total"] = JSONRaw.Num(total);
+			r["sections"] = sections;
+			if (total == 0 && search != null && search != "") r["note"] = "no clip matches '" + search + "' (embedded clips need a package containing audio loaded; try type=embedded without search)";
+			return r;
+		}
+
 
 		/// <summary>Decode a 16-bit or 32-bit-float PCM WAV file into an AudioClip on the main thread.</summary>
 		private AudioClip DecodeWav(string path, out string err) {
@@ -3683,7 +3741,7 @@ namespace VaMMCP.Api {
 		public JSONNode AtomControl(JSONNode args) {
 			Atom a = FindAtom(S(args, "uid"));
 			string la = S(args, "action").ToLowerInvariant();
-			if (la == "" ) throw new ApiError("action required: Select, FreezePhysics, UnfreezePhysics, DisableCollision, EnableCollision, IsolateEdit, EndIsolate, SetNameSpace");
+			if (la == "" ) throw new ApiError("action required: Select, FreezePhysics, UnfreezePhysics, DisableCollision, EnableCollision, IsolateEdit, EndIsolate, LoadUserDefaults");
 			JSONClass r = new JSONClass();
 			r["uid"] = a.uid;
 			if (la == "select") {
@@ -3761,6 +3819,14 @@ namespace VaMMCP.Api {
 			}
 			if (la == "setnamespace") {
 				throw new ApiError("SetNameSpace is not supported: nameSpace systems are plugin-specific; nothing settable here");
+			}
+			if (la == "loaduserdefaults") {
+				// same call AddAtomByType makes for user-created atoms: apply the main preset's user defaults
+				if (a.mainPresetControl == null) throw new ApiError(a.uid + " has no mainPresetControl (atom prefab does not ship a preset); LoadUserDefaults not possible");
+				a.mainPresetControl.LoadUserDefaults();
+				r["loaded"] = JSONRaw.Bool(true);
+				r["via"] = "mainPresetControl.LoadUserDefaults()";
+				return r;
 			}
 			throw new ApiError("unknown atom action: " + S(args, "action"));
 		}
