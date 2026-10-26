@@ -1812,6 +1812,50 @@ namespace VaMMCP.Api {
 			return r;
 		}
 
+		/// <summary>Point a person's hand control(s) at a world position or atom:
+		/// rotates the requested FreeControllerV3 (positionState/rotationState On) so
+		/// it aims at the target using LookRotation(target - handPosition). Position is
+		/// left untouched - combine with set_control to extend the arm. hand:'Left'|
+		/// 'Right'|'Both' (default Both). up: optional aim up vector (default world up).</summary>
+		public JSONNode PersonPointAt(JSONNode args) {
+			Atom p = RequirePerson(S(args, "person"));
+			Vector3 targetPos;
+			if (Has(args, "targetControl")) {
+				Atom t = FindAtom(S(args, "targetControl"));
+				if (t == null) throw new ApiError("targetControl atom not found: " + S(args, "targetControl"));
+				targetPos = t.mainController != null ? t.mainController.transform.position : t.transform.position;
+			} else if (Has(args, "target")) {
+				targetPos = ParseVec3(args["target"]);
+			} else {
+				throw new ApiError("target [x,y,z] or targetControl atom uid required");
+			}
+			string hand = S(args, "hand");
+			if (hand == "") hand = "Both";
+			Vector3 up = Has(args, "up") ? ParseVec3(args["up"]) : Vector3.up;
+			if (up.sqrMagnitude < 0.0001f) up = Vector3.up;
+			JSONClass r = new JSONClass();
+			r["person"] = p.uid;
+			r["target"] = Vec(targetPos);
+			r["hand"] = hand;
+			int applied = 0;
+			foreach (string id in new string[] { "lHandControl", "rHandControl" }) {
+				bool isLeft = id.StartsWith("l");
+				if (hand != "Both" && ((isLeft && !string.Equals(hand, "Left", StringComparison.OrdinalIgnoreCase)) || (!isLeft && !string.Equals(hand, "Right", StringComparison.OrdinalIgnoreCase)))) continue;
+				JSONStorable st = p.GetStorableByID(id);
+				FreeControllerV3 fc = st as FreeControllerV3;
+				if (fc == null) continue;
+				fc.currentPositionState = FreeControllerV3.PositionState.On;
+				fc.currentRotationState = FreeControllerV3.RotationState.On;
+				Vector3 dir = targetPos - fc.control.position;
+				if (dir.sqrMagnitude < 0.0001f) dir = Vector3.forward;
+				fc.transform.rotation = Quaternion.LookRotation(dir, up);
+				applied++;
+				r[id] = Vec(fc.control.position) + "|" + Vec(fc.control.eulerAngles);
+			}
+			r["controlsApplied"] = JSONRaw.Num(applied);
+			return r;
+		}
+
 		private static object ParseEnum(Type enumType, string name) {
 			foreach (string n in Enum.GetNames(enumType)) {
 				if (string.Equals(n, name, StringComparison.OrdinalIgnoreCase)) return Enum.Parse(enumType, n);
@@ -2529,6 +2573,139 @@ namespace VaMMCP.Api {
 			r["bytes"] = JSONRaw.Num(pngBytes);
 			if (base64 != null) {
 				// McpServer turns these two into an MCP image content block.
+				r["image_base64"] = base64;
+				r["image_mime"] = "image/png";
+			} else if (returnImage) {
+				r["note"] = "image too large to inline (" + pngBytes + " bytes); read it from path instead";
+			}
+			return r;
+		}
+
+		// ===================== independent MCP camera =====================
+
+		/// <summary>A standalone Camera that is not the editor/monitor camera
+		/// (SC.MonitorCenterCamera). Captures from it never disturb the live view,
+		/// and it can be positioned/aimed independently for off-angle screenshots.</summary>
+		private static Camera mcCamera;
+
+		/// <summary>Get or create the independent MCP camera. Recreates it after a
+		/// scene load (VaM destroys all scene GameObjects). Left disabled so it never
+		/// renders into the live view; we call cam.Render() on demand into a
+		/// RenderTexture during capture.</summary>
+		private Camera McPCamera() {
+			if (mcCamera != null && mcCamera.gameObject != null) return mcCamera;
+			GameObject go = new GameObject("VaMMCP_MCPCamera");
+			Camera cam = go.AddComponent<Camera>();
+			cam.enabled = false;
+			cam.clearFlags = CameraClearFlags.Skybox;
+			cam.backgroundColor = new Color(0.05f, 0.05f, 0.05f, 1f);
+			cam.cullingMask = -1;
+			cam.fieldOfView = 60f;
+			cam.nearClipPlane = 0.03f;
+			cam.farClipPlane = 1000f;
+			go.transform.position = new Vector3(0f, 1.5f, -3f);
+			go.transform.rotation = Quaternion.Euler(0f, 180f, 0f);
+			mcCamera = cam;
+			Log.Info("VaMMCP: created independent MCP camera " + go.name);
+			return cam;
+		}
+
+		public JSONNode McPCameraCreate(JSONNode args) {
+			Camera cam = McPCamera();
+			if (Has(args, "position")) cam.transform.position = ParseVec3(args["position"]);
+			if (Has(args, "rotation")) cam.transform.rotation = Quaternion.Euler(ParseVec3(args["rotation"]));
+			if (Has(args, "fov")) cam.fieldOfView = Num(args, "fov", 60f);
+			JSONClass r = new JSONClass();
+			r["uid"] = "mcp_camera";
+			r["name"] = cam.gameObject.name;
+			r["position"] = Vec(cam.transform.position);
+			r["rotation"] = Vec(cam.transform.eulerAngles);
+			r["fov"] = F(cam.fieldOfView);
+			r["independent"] = JSONRaw.Bool(true);
+			return r;
+		}
+
+		public JSONNode McPCameraGet(JSONNode args) {
+			Camera cam = McPCamera();
+			JSONClass r = new JSONClass();
+			r["uid"] = "mcp_camera";
+			r["name"] = cam.gameObject.name;
+			r["position"] = Vec(cam.transform.position);
+			r["rotation"] = Vec(cam.transform.eulerAngles);
+			r["fov"] = F(cam.fieldOfView);
+			r["independent"] = JSONRaw.Bool(true);
+			return r;
+		}
+
+		public JSONNode McPCameraSet(JSONNode args) {
+			Camera cam = McPCamera();
+			if (Has(args, "position")) cam.transform.position = ParseVec3(args["position"]);
+			if (Has(args, "rotation")) cam.transform.rotation = Quaternion.Euler(ParseVec3(args["rotation"]));
+			if (Has(args, "fov")) cam.fieldOfView = Num(args, "fov", cam.fieldOfView);
+			JSONClass r = new JSONClass();
+			r["uid"] = "mcp_camera";
+			r["position"] = Vec(cam.transform.position);
+			r["rotation"] = Vec(cam.transform.eulerAngles);
+			r["fov"] = F(cam.fieldOfView);
+			return r;
+		}
+
+		/// <summary>Capture a screenshot from the independent MCP camera. Renders the
+		/// camera into a RenderTexture and reads it back — works even though this
+		/// camera is not the editor camera and never shows on screen.</summary>
+		public JSONNode McPCameraCapture(JSONNode args) {
+			int w = (int)Num(args, "width", 1280);
+			int h = (int)Num(args, "height", 720);
+			if (w < 64 || h < 64) throw new ApiError("width/height too small");
+			if (w > 4096 || h > 4096) throw new ApiError("width/height too large (max 4096)");
+			bool returnImage = Bool(args, "return_image", false);
+			string path = S(args, "path");
+			if (path == "") path = "Saves/PluginData/vam-mcp/mcp_camera.png";
+			int timeoutMs = (int)Num(args, "timeout_ms", 20000);
+			FileManagerSecure.CreateDirectory("Saves/PluginData/vam-mcp");
+
+			byte[] bytes = null;
+			string captureError = null;
+			Mt.Run(delegate {
+				Camera cam = McPCamera();
+				if (cam == null) { captureError = "could not create MCP camera"; return; }
+				// Enable briefly so Render() definitely works, then restore.
+				bool wasEnabled = cam.enabled;
+				cam.enabled = true;
+				RenderTexture rt = new RenderTexture(w, h, 24);
+				RenderTexture oldTarget = cam.targetTexture;
+				RenderTexture oldActive = RenderTexture.active;
+				Texture2D tex = null;
+				try {
+					cam.targetTexture = rt;
+					cam.Render();
+					RenderTexture.active = rt;
+					tex = new Texture2D(w, h, TextureFormat.RGB24, false);
+					tex.ReadPixels(new Rect(0, 0, w, h), 0, 0);
+					tex.Apply();
+					bytes = tex.EncodeToPNG();
+				} catch (Exception e) {
+					captureError = e.Message;
+				} finally {
+					cam.targetTexture = oldTarget;
+					cam.enabled = wasEnabled;
+					RenderTexture.active = oldActive;
+					if (tex != null) UnityEngine.Object.Destroy(tex);
+					rt.Release();
+				}
+			}, 30000);
+			if (bytes == null) throw new ApiError(captureError != null ? captureError : "MCP camera capture produced no frame");
+			int pngBytes = bytes.Length;
+			FileManagerSecure.WriteAllBytes(path, bytes);
+			string base64 = null;
+			if (returnImage && bytes.Length <= MaxInlineImageBytes) base64 = Convert.ToBase64String(bytes);
+			JSONClass r = new JSONClass();
+			r["mode"] = "mcp_camera";
+			r["path"] = path;
+			r["width"] = JSONRaw.Num(w);
+			r["height"] = JSONRaw.Num(h);
+			r["bytes"] = JSONRaw.Num(pngBytes);
+			if (base64 != null) {
 				r["image_base64"] = base64;
 				r["image_mime"] = "image/png";
 			} else if (returnImage) {

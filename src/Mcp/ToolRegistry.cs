@@ -232,6 +232,13 @@ namespace VaMMCP.Mcp {
 				.P("rotation", "array", "[x, y, z] euler angles (omit to keep current)", false)
 				.P("reset", "bool", "reset simulation after the jump (default true; needs ~10 s)", false)
 				.Fn(api.PersonTeleport));
+			tools.Add(new Tool("person_point_at", "Point a person's hand control(s) at a target: rotates lHandControl/rHandControl (positionState/rotationState On) so they aim at the target via LookRotation. Position is untouched - combine with set_control to extend the arm.")
+				.P("person", "string", "Person uid (default: first Person)", false)
+				.P("target", "array", "[x, y, z] world position to point at", false)
+				.P("targetControl", "string", "Atom uid whose world position is the aim target", false)
+				.P("hand", "string", "Which hand: Left, Right, or Both (default Both)", false)
+				.P("up", "array", "[x, y, z] up vector for aim orientation (default world up)", false)
+				.Fn(api.PersonPointAt));
 			tools.Add(new Tool("set_gaze", "Adjust a person's gaze via the lookAt storable (best effort; inspect with list_storable_params storable=lookAt for the full param list).")
 				.P("person", "string", "Person uid (default: first Person)", false)
 				.P("amount", "number", "gazeAmount 0..1 (optional)", false)
@@ -289,6 +296,27 @@ namespace VaMMCP.Mcp {
 				.P("timeout_ms", "number", "How long to wait for the next rendered frame in window mode (default 20000)", false)
 				.Timeout(60000).Poller()
 				.Fn(api.CaptureView));
+
+			// ---------- independent MCP camera ----------
+			tools.Add(new Tool("mcp_camera_create", "Create (once) an independent MCP camera that never touches the editor/monitor view.")
+				.P("position", "array", "[x, y, z] world position", false)
+				.P("rotation", "array", "[x, y, z] euler angles", false)
+				.P("fov", "number", "Field of view in degrees (default 60)", false)
+				.Fn(api.McPCameraCreate));
+			tools.Add(new Tool("mcp_camera_get", "Read the independent MCP camera position, rotation and FOV.")
+				.Fn(api.McPCameraGet));
+			tools.Add(new Tool("mcp_camera_set", "Move/aim the independent MCP camera.")
+				.P("position", "array", "[x, y, z] world position", false)
+				.P("rotation", "array", "[x, y, z] euler angles", false)
+				.P("fov", "number", "Field of view in degrees", false)
+				.Fn(api.McPCameraSet));
+			tools.Add(new Tool("mcp_camera_capture", "Screenshot from the independent MCP camera (never disturbs the editor view).")
+				.P("width", "number", "Image width (default 1280, max 4096)", false)
+				.P("height", "number", "Image height (default 720, max 4096)", false)
+				.P("path", "string", "Optional output path", false)
+				.P("return_image", "boolean", "Return the PNG inline as an MCP image (default false)", false)
+				.P("timeout_ms", "number", "How long to wait for the render (default 20000)", false)
+				.Fn(api.McPCameraCapture));
 
 			// ---------- simulation ----------
 			tools.Add(new Tool("set_simulation", "Pause/resume the simulation or set the global time scale.")
