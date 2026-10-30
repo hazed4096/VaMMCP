@@ -299,9 +299,14 @@ namespace VaMMCP.Api {
 			string path = S(args, "path");
 			if (path == "") throw new ApiError("path required (see list_scenes)");
 			bool merge = Bool(args, "merge", false);
+			bool force = Bool(args, "force", false);
+			if (loadState == 2 && !force)
+				throw new ApiError("a prior scene load wedged and was healed; heal does NOT cancel the stuck loader coroutine, so moving on NOW would corrupt the next load. Restart VaM first (fresh boot resets this guard), or pass force=true to accept the corruption risk.");
+			if (LoaderBusy) throw new ApiError("a scene load is still in flight (loading=true); poll atom_info until loading flips false before loading again.");
 			if (!merge) {
 				if (!FileManagerSecure.FileExists(path)) throw new ApiError("scene file not found: " + path);
 				SC.Load(path);
+				loadState = 3;
 			} else {
 				SC.LoadMerge(path);
 			}
@@ -318,6 +323,254 @@ namespace VaMMCP.Api {
 			r["ok"] = JSONRaw.Bool(true);
 			return r;
 		}
+
+		// ---- loader diagnostics -------------------------------------------
+		// VaM's LoadInternal/LoadCo allot `new Atom[atoms.Count]` (the private
+		// Dictionary) and then call `atomsList.CopyTo(...)`, so any moment where
+		// the List has more entries than the Dictionary aborts the load with
+		// "Destination array was not long enough" after `_isLoading` was set -
+		// which is permanent ("Already loading ... Can't load another"). Reading
+		// those private fields is not possible from an MVRScript (System.Reflection
+		// is banned by VaM's script sandbox), but this BepInEx plugin may.
+		private static object Priv(string field) {
+			FieldInfo f = typeof(SuperController).GetField(field, BindingFlags.NonPublic | BindingFlags.Instance);
+			return f == null ? null : f.GetValue(SC);
+		}
+
+		public JSONNode AtomInfo(JSONNode args) {
+			Dictionary<string, Atom> dict = Priv("atoms") as Dictionary<string, Atom>;
+			List<Atom> list = Priv("atomsList") as List<Atom>;
+			HashSet<Atom> starting = Priv("startingAtoms") as HashSet<Atom>;
+			object loading = Priv("_isLoading");
+
+			JSONClass r = new JSONClass();
+			r["dict"] = JSONRaw.Num(dict == null ? -1 : dict.Count);
+			r["list"] = JSONRaw.Num(list == null ? -1 : list.Count);
+			r["starting"] = JSONRaw.Num(starting == null ? -1 : starting.Count);
+			r["loading"] = JSONRaw.Bool(loading is bool && (bool)loading);
+			r["uids"] = JSONRaw.Num(SC.GetAtomUIDs().Count);
+
+			JSONArray listBad = new JSONArray();
+			HashSet<string> seen = new HashSet<string>();
+			if (list != null) {
+				for (int i = 0; i < list.Count; i++) {
+					Atom a = list[i];
+					string why = null;
+					if (a == null) { why = "null"; }
+					else {
+						if (a.destroyed) why = "destroyed";
+						if (!seen.Add(a.uid)) why = (why == null ? "" : why + "+") + "dupUid";
+						Atom d;
+						if (dict == null || !dict.TryGetValue(a.uid, out d) || d != a) why = (why == null ? "" : why + "+") + "notInDict";
+					}
+					if (why != null) {
+						JSONClass row = new JSONClass();
+						row["i"] = JSONRaw.Num(i);
+						row["uid"] = a == null ? "" : a.uid;
+						row["why"] = why;
+						listBad.Add(row);
+					}
+				}
+			}
+			r["listBad"] = listBad;
+
+			JSONArray startBad = new JSONArray();
+			if (starting != null) {
+				foreach (Atom a in starting) {
+					string why = null;
+					if (a == null) { why = "null"; }
+					else {
+						if (a.destroyed) why = "destroyed";
+						Atom d;
+						if (dict == null || !dict.TryGetValue(a.uid, out d) || d != a) why = (why == null ? "" : why + "+") + "notInDict";
+						if (list != null && !list.Contains(a)) why = (why == null ? "" : why + "+") + "notInList";
+					}
+					if (why != null) {
+						JSONClass row = new JSONClass();
+						row["uid"] = a == null ? "" : a.uid;
+						row["why"] = why;
+						startBad.Add(row);
+					}
+				}
+			}
+			r["startingBad"] = startBad;
+			return r;
+		}
+
+		// Repairs the two states that wedge VaM's loader, without a restart:
+		//  * atomsList longer than the atoms dict (or holding dead/duplicate
+		//    entries) - rebuilt from the dict in atomUIDs order;
+		//  * stale entries in startingAtoms (an atom destroyed after it was
+		//    captured at boot) - pruned, because LoadCo's RemoveNonStartingAtoms
+		//    copies startingAtoms into atomsList while the dict only has the
+		//    survivors, which is exactly what makes CopyTo throw;
+		//  * _isLoading stuck at true after such an abort ("Already loading").
+		public JSONNode LoaderHeal(JSONNode args) {
+			bool clearLoading = Bool(args, "clearLoading", true);
+			Dictionary<string, Atom> dict = Priv("atoms") as Dictionary<string, Atom>;
+			List<Atom> list = Priv("atomsList") as List<Atom>;
+			HashSet<Atom> starting = Priv("startingAtoms") as HashSet<Atom>;
+			FieldInfo fl = typeof(SuperController).GetField("atomsList", BindingFlags.NonPublic | BindingFlags.Instance);
+			FieldInfo fi = typeof(SuperController).GetField("_isLoading", BindingFlags.NonPublic | BindingFlags.Instance);
+
+			JSONClass r = new JSONClass();
+			if (dict == null || list == null || fl == null) throw new ApiError("could not read SuperController atom lists");
+			int beforeList = list.Count;
+			int beforeDict = dict.Count;
+
+			int prunedStarting = 0;
+			if (starting != null) {
+				List<Atom> keep = new List<Atom>();
+				foreach (Atom a in starting) {
+					Atom d;
+					if (a == null || a.destroyed || !dict.TryGetValue(a.uid, out d) || d != a) { prunedStarting++; continue; }
+					keep.Add(a);
+				}
+				if (prunedStarting > 0) {
+					starting.Clear();
+					foreach (Atom a in keep) starting.Add(a);
+				}
+			}
+
+			List<Atom> rebuilt = new List<Atom>();
+			HashSet<string> added = new HashSet<string>();
+			foreach (string uid in SC.GetAtomUIDs()) {
+				Atom a;
+				if (uid != null && dict.TryGetValue(uid, out a) && a != null && !a.destroyed && added.Add(uid)) rebuilt.Add(a);
+			}
+			foreach (KeyValuePair<string, Atom> kv in dict) {
+				if (kv.Value != null && !kv.Value.destroyed && added.Add(kv.Key)) rebuilt.Add(kv.Value);
+			}
+			fl.SetValue(SC, rebuilt);
+
+			if (clearLoading && fi != null) fi.SetValue(SC, false);
+			if (loadState == 0) loadState = 2;
+
+			r["dict"] = JSONRaw.Num(beforeDict);
+			r["listBefore"] = JSONRaw.Num(beforeList);
+			r["listAfter"] = JSONRaw.Num(rebuilt.Count);
+			r["prunedStarting"] = JSONRaw.Num(prunedStarting);
+			r["clearedLoading"] = JSONRaw.Bool(clearLoading);
+			return r;
+		}
+
+		// Called from Plugin.Update every few frames. A healthy VaM keeps the
+		// atoms dict and atomsList in step, so any lasting mismatch (or a dead /
+		// duplicated entry) is the fatal pre-state of the next load: as soon as
+		// List.Count > Dictionary.Count, LoadInternal/LoadCo throw at
+		// "Destination array was not long enough" and _isLoading stays true.
+		// Repairing it the moment it appears keeps consecutive scene loads working.
+		// Reproduced here: a scene carrying WindowCamera atoms destroys the boot
+		// WindowCamera atom during the NEXT load; RemoveNonStartingAtoms then
+		// rebuilds atomsList from a startingAtoms set that still holds the dead
+		// atom, so list (4) ends up longer than dict (3).
+		public static void LoaderWatchdog() {
+			if (SC == null) return;
+			bool loading = (bool)Priv("_isLoading");
+			if (loading && loadStartedAt == 0f) loadStartedAt = Time.realtimeSinceStartup;
+			if (!loading) loadStartedAt = 0f;
+			if (prevLoading && !loading && loadState != 0) {
+				loadState = 0;
+				Log.Info("VaMMCP loader watchdog: load completed cleanly, wedge guard reset");
+			}
+			prevLoading = loading;
+			// Force-clear a stuck load so the loader can never be permanently
+			// wedged by a single aborted LoadCo (seen 2026-10-27: heal+reload
+			// looped 30+ times without progress). It MUST be progress-aware: a
+			// big scene legitimately needs ~3 minutes here (153 atoms, Persons
+			// and clothing stream in asynchronously), and clearing _isLoading
+			// mid-stream corrupts the scene - the interrupted load's atoms stay
+			// behind and the next load creates "#2" duplicates of 40+ atoms
+			// (measured 2026-10-29: 197 atoms, Girl1#2/Girl2#2/NMC Panel*#2).
+			Dictionary<string, Atom> dictNow = Priv("atoms") as Dictionary<string, Atom>;
+			int countNow = dictNow == null ? 0 : dictNow.Count;
+			if (loading) {
+				if (countNow != loadAtomCount) {
+					loadAtomCount = countNow;
+					loadProgressAt = Time.realtimeSinceStartup;
+				}
+			} else {
+				loadAtomCount = 0;
+				loadProgressAt = 0f;
+			}
+			if (loading && loadStartedAt > 0f && (Time.realtimeSinceStartup - loadStartedAt) > 180f
+				&& (loadProgressAt == 0f || (Time.realtimeSinceStartup - loadProgressAt) > 90f)) {
+				FieldInfo fi = typeof(SuperController).GetField("_isLoading", BindingFlags.NonPublic | BindingFlags.Instance);
+				if (fi != null) fi.SetValue(SC, false);
+				loadState = 0;
+				loadStartedAt = 0f;
+				Log.Warn("VaMMCP loader watchdog: load stalled (no atom progress for >90s at " + countNow + " atoms), force-cleared _isLoading");
+			}
+			Dictionary<string, Atom> dict = Priv("atoms") as Dictionary<string, Atom>;
+			List<Atom> list = Priv("atomsList") as List<Atom>;
+			if (dict == null || list == null) return;
+
+			bool broken = list.Count != dict.Count;
+			if (!broken) {
+				HashSet<string> seen = new HashSet<string>();
+				for (int i = 0; i < list.Count; i++) {
+					Atom a = list[i];
+					Atom d;
+					if (a == null || a.destroyed || !seen.Add(a.uid) || !dict.TryGetValue(a.uid, out d) || d != a) { broken = true; break; }
+				}
+			}
+
+			HashSet<Atom> starting = Priv("startingAtoms") as HashSet<Atom>;
+			bool staleStart = false;
+			if (starting != null) {
+				foreach (Atom a in starting) {
+					Atom d;
+					if (a == null || a.destroyed || !dict.TryGetValue(a.uid, out d) || d != a) { staleStart = true; break; }
+				}
+			}
+			if (!broken && !staleStart) return;
+
+			FieldInfo fl = typeof(SuperController).GetField("atomsList", BindingFlags.NonPublic | BindingFlags.Instance);
+			string before = "dict=" + dict.Count + " list=" + list.Count + " starting=" + (starting == null ? -1 : starting.Count);
+
+			int pruned = 0;
+			if (starting != null && staleStart) {
+				List<Atom> keep = new List<Atom>();
+				foreach (Atom a in starting) {
+					Atom d;
+					if (a == null || a.destroyed || !dict.TryGetValue(a.uid, out d) || d != a) { pruned++; continue; }
+					keep.Add(a);
+				}
+				starting.Clear();
+				foreach (Atom a in keep) starting.Add(a);
+			}
+			if (broken && fl != null) {
+				List<Atom> rebuilt = new List<Atom>();
+				HashSet<string> added = new HashSet<string>();
+				foreach (string uid in SC.GetAtomUIDs()) {
+					Atom a;
+					if (uid != null && dict.TryGetValue(uid, out a) && a != null && !a.destroyed && added.Add(uid)) rebuilt.Add(a);
+				}
+				foreach (KeyValuePair<string, Atom> kv in dict) {
+					if (kv.Value != null && !kv.Value.destroyed && added.Add(kv.Key)) rebuilt.Add(kv.Value);
+				}
+				fl.SetValue(SC, rebuilt);
+			}
+			Log.Info("VaMMCP loader watchdog: repaired (" + before + " -> dict=" + dict.Count
+				+ " list=" + ((List<Atom>)fl.GetValue(SC)).Count + " prunedStarting=" + pruned + ")");
+			if (loadState == 0) loadState = 2;
+		}
+
+		/// <summary>0 = clean, 2 = healed since the last clean load, 3 = loading in flight.
+		/// A heal clears _isLoading but can NOT cancel the stuck LoadCo coroutine, so
+		/// loading again afterwards stacks a second loader on live state and wedges
+		/// far earlier (observed 2026-10-27: heal + reload x3 degraded dict stale at
+		/// 63/153/172 with loading=true each time). After any heal the only safe load
+		/// is a fresh VaM boot (which resets loadState to 0 by definition).</summary>
+		public static int loadState;
+		private static bool prevLoading;
+		private static float loadStartedAt;
+		private static float loadProgressAt;
+		private static int loadAtomCount;
+
+		/// <summary>Return true when the app is mid-load (or healed-after-wedge) and the
+		/// caller should poll atom_info instead of issuing further load/scene-changing calls.</summary>
+		public static bool LoaderBusy { get { return SC != null && (bool)Priv("_isLoading"); } }
 
 		/// <summary>Normalize a save path to VaM style (backslashes), ensure its directory exists, and remove an existing file
 		/// (VaM asks for user confirmation when overwriting an existing file from a plugin context — we delete via System.IO first so Save writes fresh).</summary>
@@ -342,11 +595,33 @@ namespace VaMMCP.Api {
 			return path;
 		}
 
+		// VaM pops its "Aim head ... or press Escape to skip" thumbnail overlay on
+		// every save: a ScreenShotCanvas with the Skip button plus the live preview
+		// image (LoResScreenshotPreview). It stays up until Escape or a mouse click
+		// and a scene load does not clear it, so it used to be left on screen after
+		// every scripted save. Hide it right after saving (and for a moment after,
+		// in case VaM shows it a frame later).
+		public static float HideScreenshotPromptUntil;
+
+		public static void HideScreenshotPrompt() {
+			try {
+				Transform[] all = UnityEngine.Object.FindObjectsOfType<Transform>();
+				for (int i = 0; i < all.Length; i++) {
+					string n = all[i].name;
+					if (n == "ScreenShotCanvas" || n == "LoResScreenshotPreview" || n == "HiResScreenshotPreview") {
+						all[i].gameObject.SetActive(false);
+					}
+				}
+			} catch (Exception e) { Log.Debug("hide screenshot prompt: " + e.Message); }
+		}
+
 		public JSONNode SaveScene(JSONNode args) {
 			string path = S(args, "path");
 			if (path == "") path = "Saves/scene/VaMMCP_" + Timestamp() + ".json";
 			if (!path.EndsWith(".json")) path += ".json";
 			SC.Save(PrepareSavePath(path));
+			HideScreenshotPromptUntil = Time.unscaledTime + 1.5f;
+			HideScreenshotPrompt();
 			JSONClass r = new JSONClass();
 			r["saved"] = path;
 			return r;
@@ -1094,6 +1369,152 @@ namespace VaMMCP.Api {
 
 		// ===================== clothing / hair =====================
 
+		/// <summary>Resolve a worn (or library) clothing item on a person.</summary>
+		private static DAZClothingItem ClothingItemOn(Atom p, DAZCharacterSelector sel, string id) {
+			DAZClothingItem item = FindClothingItem(sel, id);
+			if (item == null) throw new ApiError("clothing item not found: " + id + " (see list_clothing_items)");
+			return item;
+		}
+
+		/// <summary>Every DAZMorph inside a worn clothing item's morph banks
+		/// (garment/clothing morphs, e.g. the Tifa bra's cup-size controls). These live
+		/// under <c>DAZMorphBank</c> components on the item, same DAZMorph objects the
+		/// person uses - only their banks live on the item. When banks are empty (DAZ
+		/// garments give the item a MorphsControlUI instead), the morphs are pulled off
+		/// the clothing item control's UI.</summary>
+		private static IEnumerable<DAZMorph> ItemMorphs(DAZClothingItem item) {
+			HashSet<string> seen = new HashSet<string>();
+			foreach (DAZMorph m in ItemMorphsBanks(item)) {
+				if (m == null) continue;
+				if (seen.Add(m.uid)) yield return m;
+			}
+			DAZClothingItemControl ctrl = item.GetComponentInChildren<DAZClothingItemControl>();
+			if (ctrl == null) yield break;
+			object ui = null;
+			try {
+				ui = ctrl.GetType().GetField("morphsControlUI", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance).GetValue(ctrl);
+			} catch { }
+			if (ui == null) {
+				Component c = FindComponentByTypePartial(item, "MorphsControlUI");
+				if (c != null) ui = c;
+			}
+			if (ui == null) yield break;
+			for (Type t = ui.GetType(); t != null && t != typeof(object); t = t.BaseType) {
+				foreach (FieldInfo fi in t.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)) {
+					if (fi.FieldType == typeof(List<DAZMorph>) || fi.FieldType == typeof(DAZMorph[])) {
+						IEnumerable e = fi.GetValue(ui) as IEnumerable;
+						if (e == null) continue;
+						foreach (DAZMorph m in e) {
+							if (m != null && seen.Add(m.uid)) yield return m;
+						}
+					}
+				}
+			}
+		}
+
+		private static IEnumerable<DAZMorph> ItemMorphsBanks(DAZClothingItem item) {
+			DAZMorphBank[] banks = item.GetComponentsInChildren<DAZMorphBank>(true);
+			foreach (DAZMorphBank bank in banks) {
+				if (bank == null || bank.morphs == null) continue;
+				foreach (DAZMorph m in bank.morphs) {
+					if (m != null) yield return m;
+				}
+			}
+		}
+
+		/// <summary>Find the first component under `root` whose type name contains
+		/// `partialName` (avoids an external types reference for UI internals).</summary>
+		private static Component FindComponentByTypePartial(Component root, string partialName) {
+			Component[] all = root.GetComponentsInChildren<Component>(true);
+			foreach (Component c in all) {
+				if (c != null && c.GetType().Name.IndexOf(partialName, StringComparison.OrdinalIgnoreCase) >= 0) return c;
+			}
+			return null;
+		}
+
+		/// <summary>List garment morphs of one worn clothing item (all items when no
+		/// id given, via the person's whole clothing list).</summary>
+		public JSONNode GarmentMorphs(JSONNode args, string _unused) {
+			Atom p = RequirePerson(S(args, "person"));
+			DAZCharacterSelector sel = Selector(p);
+			string id = S(args, "id");
+			string search = S(args, "search").ToLowerInvariant();
+			JSONArray morphs = new JSONArray();
+			DAZClothingItem[] items = sel.clothingItems;
+			if (items == null) items = new DAZClothingItem[0];
+			foreach (DAZClothingItem it in items) {
+				if (it == null || !it.active) continue;
+				if (it == CreatorFor(sel)) continue;
+				if (id != "" && it != FindClothingItem(sel, id)) continue;
+				foreach (DAZMorph m in ItemMorphs(it)) {
+					string dn = m.displayName != null ? m.displayName : "";
+					string mu = m.uid != null ? m.uid : "";
+					if (search != "" && dn.ToLowerInvariant().IndexOf(search, StringComparison.Ordinal) < 0
+						&& mu.ToLowerInvariant().IndexOf(search, StringComparison.Ordinal) < 0) continue;
+					JSONClass row = new JSONClass();
+					row["item"] = it.uid != null ? it.uid : "";
+					row["name"] = dn;
+					row["uid"] = mu;
+					row["region"] = m.region != null ? m.region : "";
+					row["group"] = m.group != null ? m.group : "";
+					row["value"] = F(m.morphValue);
+					morphs.Add(row);
+				}
+			}
+			JSONClass r = new JSONClass();
+			r["person"] = p.uid;
+			r["count"] = JSONRaw.Num(morphs.Count);
+			r["morphs"] = morphs;
+			return r;
+		}
+
+		/// <summary>Set one garment morph value by name/uid on a worn clothing item,
+		/// then nudge the item's mesh to re-sync (morphValue setter already notifies
+		/// the owning DAZCharacterSelector pipeline).</summary>
+		public JSONNode SetGarmentMorph(JSONNode args) {
+			Atom p = RequirePerson(S(args, "person"));
+			DAZCharacterSelector sel = Selector(p);
+			string id = S(args, "id");
+			string name = S(args, "name");
+			float value = Num(args, "value", 0f);
+			DAZClothingItem item = FindClothingItem(sel, id);
+			DAZMorph hit = null;
+			HashSet<string> seen = new HashSet<string>();
+			foreach (DAZClothingItem it in items_alive(sel)) {
+				if (it == null || !it.active) continue;
+				if (it == CreatorFor(sel)) continue;
+				if (item != null && it != item) continue;
+				foreach (DAZMorph m in ItemMorphs(it)) {
+					string dn = m.displayName != null ? m.displayName.ToLowerInvariant() : "";
+					string mu = m.uid != null ? m.uid.ToLowerInvariant() : "";
+					if (dn == name.ToLowerInvariant() || mu == name.ToLowerInvariant()) {
+						if (hit != null) throw new ApiError("ambiguous morph " + name + " (two items carry it); pass an explicit item id");
+						hit = m;
+						seen.Add(it.uid);
+					}
+				}
+			}
+			if (hit == null) throw new ApiError("garment morph not found: " + name + " (see list_item_morphs)");
+			hit.morphValue = value;
+			JSONClass r = new JSONClass();
+			r["person"] = p.uid;
+			r["item"] = drop_first_toString(seen);
+			r["name"] = hit.displayName != null ? hit.displayName : name;
+			r["value"] = F(hit.morphValue);
+			return r;
+		}
+
+		private static IEnumerable<DAZClothingItem> items_alive(DAZCharacterSelector sel) {
+			DAZClothingItem[] items = sel.clothingItems;
+			if (items == null) yield break;
+			foreach (DAZClothingItem it in items) yield return it;
+		}
+
+		private static string drop_first_toString(HashSet<string> seen) {
+			foreach (string s in seen) return s;
+			return "";
+		}
+
 		/// <summary>Clothing items on a person. <c>sel.clothingItems</c> is the person's whole
 		/// clothing *library* (every item VaM has instantiated, worn or not), so by default we
 		/// return only what is actually worn and summarise the rest. Pass <c>all=true</c> for the
@@ -1307,9 +1728,22 @@ namespace VaMMCP.Api {
 				activated = addedUid != null;
 			}
 
+			// Reflection fallback (BepInEx context, unrestricted). In VaM 1.22.0.3 the
+			// creator's LoadFromPath can stop at its 'Not ready for load. Invalid load
+			// path or params' guard even with a ready creator - add_item then died with
+			// 'VaM created no clothing item'. Scene LOADS restore garments fine through
+			// other entry points, so probe those signatures and keep the first one that
+			// yields a new active item. Every attempt is traced into the response.
+			JSONArray fallbackTrace = new JSONArray();
+			if (addedUid == null) {
+				string uid2 = ClothingAddFallback(p, drc, path, fallbackTrace, ref activated);
+				if (uid2 != null) addedUid = uid2;
+			}
+
 			JSONClass r = new JSONClass();
 			r["person"] = p.uid;
 			r["path"] = path;
+			if (fallbackTrace.Count > 0) r["fallback"] = fallbackTrace;
 			if (addedUid != null) {
 				r["ok"] = JSONRaw.Bool(true);
 				r["added"] = addedUid;
@@ -1333,6 +1767,141 @@ namespace VaMMCP.Api {
 				+ "clothing creator runtime), then retry. Paths must point at a .vam "
 				+ "clothing item (see list_clothing_presets), not at a folder.";
 			return r;
+		}
+
+		/// <summary>Reflection-driven probe for a working clothing load entry point on
+		/// VaM 1.22.0.3, mirroring what scene loads do. Tries, in order: the
+		/// DAZRuntimeCreator type-chain 'LoadFromPath' overloads, then
+		/// DAZCharacterSelector methods whose name contains 'Clothing' and
+		/// (Load|Add|Restore|Set). Only signatures whitelisted in BuildClothingAddArgs
+		/// get invoked. Returns the new active item uid, or null; every attempt is
+		/// traced into `trace`.</summary>
+		private string ClothingAddFallback(Atom p, Component drc, string path, JSONArray trace, ref bool activated) {
+			List<object[]> plan = Mt.Run(() => BuildClothingAddPlan(drc), 15000);
+			if (plan == null) return null;
+			for (int i = 0; i < plan.Count; i++) {
+				MethodInfo mi = (MethodInfo)plan[i][0];
+				bool useSelector = plan[i][1] is bool && (bool)plan[i][1];
+				ClothingTryResult res = Mt.Run(() => TryClothingAdd(p, mi, useSelector, path), 25000);
+				JSONClass row = new JSONClass();
+				row["try"] = mi.Name;
+				row["newUid"] = res != null && res.NewUid != null ? res.NewUid : "";
+				row["note"] = res != null && res.Item != null ? res.Item : "";
+				trace.Add(row);
+				if (res != null && res.NewUid != null) {
+					activated = true;
+					return res.NewUid;
+				}
+			}
+			return null;
+		}
+
+		private class ClothingTryResult { public string NewUid; public string Item; }
+
+		/// <summary>Collect (MethodInfo, runOnSelector) pairs worth trying: the runtime
+		/// creator type chain's LoadFromPath overloads, then DAZCharacterSelector
+		/// 'Clothing'-named load/add/restore methods that we can call safely.
+		/// Main-thread utility (GetMethods touches type metadata only).</summary>
+		private static List<object[]> BuildClothingAddPlan(Component drc) {
+			List<object[]> plan = new List<object[]>();
+			if (drc != null) {
+				for (Type t = drc.GetType(); t != null && t != typeof(object); t = t.BaseType) {
+					foreach (MethodInfo m in t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)) {
+						if (m.Name.IndexOf("LoadFromPath", StringComparison.OrdinalIgnoreCase) >= 0 && AcceptableClothingSig(m)) {
+							plan.Add(new object[] { m, false });
+						}
+					}
+				}
+			}
+			for (Type t = typeof(DAZCharacterSelector); t != null && t != typeof(object); t = t.BaseType) {
+				foreach (MethodInfo m in t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)) {
+					string ln = m.Name.ToLowerInvariant();
+					if (ln.IndexOf("clothing", StringComparison.Ordinal) < 0) continue;
+					if (!(ln.Contains("load") || ln.Contains("add") || ln.Contains("restore") || ln.Contains("set"))) continue;
+					if (!AcceptableClothingSig(m)) continue;
+					plan.Add(new object[] { m, true });
+				}
+			}
+			return plan;
+		}
+
+		private static bool AcceptableClothingSig(MethodInfo m) {
+			ParameterInfo[] ps = m.GetParameters();
+			if (ps.Length == 0 || ps[0].ParameterType != typeof(string)) return false;
+			if (ps.Length == 1) return true;
+			Type p1 = ps[1].ParameterType;
+			if (ps.Length == 2) return p1 == typeof(bool)
+				|| typeof(JSONNode).IsAssignableFrom(p1)
+				|| p1 == typeof(string)
+				|| typeof(DAZDynamicItem).IsAssignableFrom(p1);
+			if (ps.Length == 3) {
+				Type p2 = ps[2].ParameterType;
+				if (p1 == typeof(string) && p2 == typeof(bool)) return true;
+				if (typeof(DAZDynamicItem).IsAssignableFrom(p1) && p2 == typeof(bool)) return true;
+			}
+			return false;
+		}
+
+		/// <summary>Invoke one candidate on the main thread and poll up to 8 s for a NEW
+		/// active clothing uid. The Thread.Sleep inside runs on the dispatcher worker
+		/// coroutine context like the other poll loops. Returns the new uid, or null;
+		/// failure reasons land in `Item`.</summary>
+		private ClothingTryResult TryClothingAdd(Atom p, MethodInfo mi, bool useSelector, string path) {
+			ClothingTryResult res = new ClothingTryResult();
+			DAZCharacterSelector sel = Selector(p);
+			if (sel == null) { res.Item = "no selector"; return res; }
+			object[] vals = BuildClothingAddArgs(mi.GetParameters(), path, RuntimeCreatorOf(sel));
+			if (vals == null) { res.Item = "sig shape not whitelisted"; return res; }
+			HashSet<string> before = ActiveClothingUids(sel);
+			object target = useSelector ? (object)sel : (object)(RuntimeCreatorOf(sel) ?? CreatorItem(sel));
+			try {
+				mi.Invoke(target, vals);
+			} catch (Exception e) {
+				Exception inner = e.InnerException != null ? e.InnerException : e;
+				res.Item = "throw: " + inner.Message;
+				return res;
+			}
+			DateTime dl = DateTime.UtcNow.AddSeconds(8);
+			while (DateTime.UtcNow < dl) {
+				sel = Selector(p);
+				HashSet<string> now = ActiveClothingUids(sel);
+				foreach (string u in now) {
+					if (!before.Contains(u)) { res.NewUid = u; return res; }
+				}
+				Thread.Sleep(400);
+			}
+			res.Item = "no new item after 8s";
+			return res;
+		}
+
+		/// <summary>The person's runtime creator component (DAZRuntimeCreator, may be
+		/// null) - the invocation target for LoadFromPath-style overloads.</summary>
+		private static Component RuntimeCreatorOf(DAZCharacterSelector sel) {
+			DAZClothingItem creator = CreatorItem(sel);
+			if (creator == null) return null;
+			return FindComponent(creator, "DAZRuntimeCreator");
+		}
+
+		private static DAZClothingItem CreatorItem(DAZCharacterSelector sel) {
+			return sel.gender == DAZCharacterSelector.Gender.Male
+				? sel.maleClothingCreatorItem : sel.femaleClothingCreatorItem;
+		}
+
+		private static object[] BuildClothingAddArgs(ParameterInfo[] ps, string path, Component drc) {
+			if (ps.Length == 1) return new object[] { path };
+			if (ps.Length == 2) {
+				Type p1 = ps[1].ParameterType;
+				if (p1 == typeof(bool)) return new object[] { path, true };
+				if (typeof(JSONNode).IsAssignableFrom(p1)) return new object[] { path, null };
+				if (p1 == typeof(string)) return new object[] { path, "" };
+				if (typeof(DAZDynamicItem).IsAssignableFrom(p1)) return new object[] { path, drc };
+			}
+			if (ps.Length == 3) {
+				Type p1 = ps[1].ParameterType, p2 = ps[2].ParameterType;
+				if (p1 == typeof(string) && p2 == typeof(bool)) return new object[] { path, "", true };
+				if (typeof(DAZDynamicItem).IsAssignableFrom(p1) && p2 == typeof(bool)) return new object[] { path, drc, true };
+			}
+			return null;
 		}
 
 		/// <summary>Initialise a person's runtime clothing creator: the equivalent of
@@ -2375,12 +2944,25 @@ namespace VaMMCP.Api {
 			return cam;
 		}
 
+		/// <summary>Which camera a call should drive. The independent MCP camera is
+		/// the DEFAULT so tool use never moves the user's editor view; the editor /
+		/// monitor camera is only touched when explicitly asked for
+		/// ("camera":"editor" or editor=true).</summary>
+		private static bool WantsEditorCamera(JSONNode args) {
+			string c = S(args, "camera").ToLowerInvariant();
+			if (c == "editor" || c == "monitor" || c == "user" || c == "view") return true;
+			if (c == "mcp" || c == "own" || c == "independent") return false;
+			return Bool(args, "editor", false);
+		}
+
 		public JSONNode GetCamera() {
 			Camera cam = MonitorCamera();
 			JSONClass r = new JSONClass();
 			r["position"] = Vec(cam.transform.position);
 			r["rotation"] = Vec(cam.transform.eulerAngles);
 			r["fov"] = F(cam.fieldOfView);
+			r["camera_name"] = cam.gameObject.name;
+			r["independent"] = JSONRaw.Bool(false);
 			return r;
 		}
 
@@ -2401,13 +2983,16 @@ namespace VaMMCP.Api {
 		/// </summary>
 		public JSONNode AimCamera(JSONNode args) {
 			Vector3 target = ResolveTargetPoint(args);
-			Camera cam = MonitorCamera();
+			bool editor = WantsEditorCamera(args);
+			Camera cam = editor ? MonitorCamera() : McPCamera();
 			JSONClass res = new JSONClass();
 			if (Has(args, "position")) cam.transform.position = ParseVec3(args["position"]);
 			if (Has(args, "fov")) cam.fieldOfView = Num(args, "fov", cam.fieldOfView);
 			cam.transform.rotation = Quaternion.LookRotation(target - cam.transform.position, Vector3.up);
 			res["aimedAt"] = Vec(target);
-			res["camera"] = GetCamera();
+			res["camera_name"] = cam.gameObject.name;
+			res["independent"] = JSONRaw.Bool(!editor);
+			res["camera"] = editor ? GetCamera() : McPCameraGet(args);
 			return res;
 		}
 
@@ -2423,6 +3008,7 @@ namespace VaMMCP.Api {
 				return GetControl(p, controlId).control.position;
 			}
 			string uid = S(args, "uid");
+			if (uid == "") uid = S(args, "target_uid");
 			if (uid == "") throw new ApiError("aim target required: provide 'uid' or 'person'");
 			Atom atom = SuperController.singleton.GetAtomByUid(uid);
 			if (atom == null) throw new ApiError("atom not found: " + uid);
@@ -2459,10 +3045,16 @@ namespace VaMMCP.Api {
 		/// several seconds on an idle VaM (IdleSaver's 1 fps), hence the 20 s default poll.
 		/// </summary>
 		public JSONNode CaptureView(JSONNode args) {
-			string mode = S(args, "mode");
-			if (mode == "") mode = "window";
-			if (mode == "camera") return CaptureViewCamera(args);
-			if (mode != "window") throw new ApiError("mode must be 'window' (default) or 'camera'");
+			string mode = S(args, "mode").ToLowerInvariant();
+			// Default: the independent MCP camera. It renders into its own
+			// RenderTexture, so a capture never moves or disturbs the user's
+			// editor view. mode="editor" renders the monitor camera (still without
+			// moving it), mode="window" grabs the real back buffer (only mode that
+			// includes DAZ person skin/clothing).
+			if (mode == "") mode = WantsEditorCamera(args) ? "editor" : "mcp";
+			if (mode == "mcp" || mode == "own" || mode == "independent") return McPCameraCapture(args);
+			if (mode == "editor" || mode == "camera" || mode == "monitor") return CaptureViewCamera(args);
+			if (mode != "window") throw new ApiError("mode must be 'mcp' (default), 'editor' or 'window'");
 
 			int w = (int)Num(args, "width", 1280);
 			int h = (int)Num(args, "height", 720);
@@ -2669,6 +3261,17 @@ namespace VaMMCP.Api {
 			Mt.Run(delegate {
 				Camera cam = McPCamera();
 				if (cam == null) { captureError = "could not create MCP camera"; return; }
+				// Optional one-call framing: move / aim this camera (never the
+				// editor camera) before rendering.
+				if (Has(args, "position")) cam.transform.position = ParseVec3(args["position"]);
+				if (Has(args, "rotation")) cam.transform.rotation = Quaternion.Euler(ParseVec3(args["rotation"]));
+				if (Has(args, "fov")) cam.fieldOfView = Num(args, "fov", cam.fieldOfView);
+				string tUid = S(args, "uid");
+				if (tUid == "") tUid = S(args, "target_uid");
+				if (tUid != "" || S(args, "person") != "") {
+					Vector3 target = ResolveTargetPoint(args);
+					cam.transform.rotation = Quaternion.LookRotation(target - cam.transform.position, Vector3.up);
+				}
 				// Enable briefly so Render() definitely works, then restore.
 				bool wasEnabled = cam.enabled;
 				cam.enabled = true;
@@ -4149,6 +4752,147 @@ namespace VaMMCP.Api {
 			throw new ApiError("unknown atom action: " + S(args, "action"));
 		}
 
+		public JSONNode AtomAction(JSONNode args) {
+			string la = S(args, "action").ToLowerInvariant();
+			string moveActions = ",setposition,setrotation,setscale,snaptoground,alignto,resettransform,parentto,unparent,wheelcreate,wheelangle,wheelstatus,";
+			if (moveActions.Contains("," + la + ",")) return AtomMove(args);
+			return AtomControl(args);
+		}
+
+		// Calls a method by name with the given arguments, public or not. Used for
+		// VaM's own parenting API (SubScene.AddAtomToSubScene / Atom.SetParentAtom),
+		// which is not reachable from the plugin script sandbox but is fine here.
+		private static void InvokeAny(object target, string name, params object[] argv) {
+			Type t = target.GetType();
+			MethodInfo[] ms = t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+			for (int i = 0; i < ms.Length; i++) {
+				if (ms[i].Name != name) continue;
+				ParameterInfo[] ps = ms[i].GetParameters();
+				if (ps.Length != argv.Length) continue;
+				ms[i].Invoke(target, argv);
+				return;
+			}
+			throw new ApiError(name + "(" + argv.Length + " args) not found on " + t.Name);
+		}
+
+		/// <summary>Parent an atom to a SubScene atom (or any atom). Parenting is
+		/// what makes a group rotate rigidly: rotate the parent and every child
+		/// follows without touching a single control, so no physics churn.</summary>
+		public JSONNode ParentAtomTo(Atom child, Atom parent) {
+			JSONClass r = new JSONClass();
+			r["uid"] = child.uid;
+			r["parent"] = parent.uid;
+			Mt.Run(delegate {
+				// VaM's UI "Parent Atom" is the Atom.parentAtom property. SubScene's
+				// AddAtomToSubScene has an overload set that reflection-by-name could
+				// not match (ArgumentException: failed to convert parameters), and a
+				// plain transform re-parent leaves VaM's bookkeeping stale, so set
+				// the property itself and fall back to the transform.
+				bool done = false;
+				try {
+					PropertyInfo pi = typeof(Atom).GetProperty("parentAtom",
+						BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+					if (pi != null && pi.CanWrite) { pi.SetValue(child, parent, null); done = true; }
+				} catch (Exception) { }
+				if (!done) {
+					try { InvokeAny(child, "SetParentAtom", parent); done = true; }
+					catch (Exception) { }
+				}
+				if (!done) child.transform.SetParent(parent.transform, true);
+			}, 10000);
+			r["ok"] = JSONRaw.Bool(true);
+			return r;
+		}
+
+		public JSONNode UnparentAtom(Atom child) {
+			JSONClass r = new JSONClass();
+			r["uid"] = child.uid;
+			Mt.Run(delegate {
+				bool done = false;
+				try {
+					PropertyInfo pi = typeof(Atom).GetProperty("parentAtom",
+						BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+					if (pi != null && pi.CanWrite) { pi.SetValue(child, null, null); done = true; }
+				} catch (Exception) { }
+				if (!done) child.transform.SetParent(null, true);
+			}, 10000);
+			r["ok"] = JSONRaw.Bool(true);
+			return r;
+		}
+
+		// ---- wheel: rotate a group of atoms rigidly about a pivot atom --------
+		private static Atom wheelPivot;
+		private static readonly List<Atom> wheelAtoms = new List<Atom>();
+		private static Vector3[] wheelBasePos;
+		private static Quaternion[] wheelBaseRot;
+		private static float wheelAngle;
+
+		public JSONNode WheelCreate(string spec) {
+			int bar = spec.IndexOf('|');
+			if (bar <= 0) throw new ApiError("value must be pivotUid|atomUid;atomUid;...");
+			string pivotUid = spec.Substring(0, bar).Trim();
+			string[] uids = spec.Substring(bar + 1).Split(';');
+			Atom pivot = FindAtom(pivotUid);
+			wheelPivot = pivot;
+			wheelAtoms.Clear();
+			List<Vector3> pos = new List<Vector3>();
+			List<Quaternion> rot = new List<Quaternion>();
+			List<string> missing = new List<string>();
+			for (int i = 0; i < uids.Length; i++) {
+				string u = uids[i].Trim();
+				if (u == "") continue;
+				Atom a = null;
+				try { a = FindAtom(u); } catch (Exception) { }
+				if (a == null) { missing.Add(u); continue; }
+				wheelAtoms.Add(a);
+				pos.Add(a.transform.position);
+				rot.Add(a.transform.rotation);
+			}
+			wheelBasePos = pos.ToArray();
+			wheelBaseRot = rot.ToArray();
+			wheelAngle = 0f;
+			JSONClass r = new JSONClass();
+			r["pivot"] = pivot.uid;
+			r["pivotPos"] = Vec(pivot.transform.position);
+			r["atoms"] = JSONRaw.Num(wheelAtoms.Count);
+			r["missing"] = string.Join(", ", missing.ToArray());
+			return r;
+		}
+
+		public JSONNode WheelAngle(float deg) {
+			if (wheelPivot == null || wheelAtoms.Count == 0)
+				throw new ApiError("no wheel: call atom_action action=WheelCreate first");
+			wheelAngle = deg;
+			Vector3 p = wheelPivot.transform.position;
+			Quaternion R = Quaternion.Euler(deg, 0f, 0f);
+			Mt.Run(delegate {
+				for (int i = 0; i < wheelAtoms.Count; i++) {
+					Atom a = wheelAtoms[i];
+					if (a == null) continue;
+					a.transform.position = p + R * (wheelBasePos[i] - p);
+					a.transform.rotation = R * wheelBaseRot[i];
+				}
+			}, 10000);
+			JSONClass r = new JSONClass();
+			r["angle"] = F(deg);
+			r["atoms"] = JSONRaw.Num(wheelAtoms.Count);
+			r["pivot"] = wheelPivot.uid;
+			return r;
+		}
+
+		public JSONNode WheelStatus() {
+			JSONClass r = new JSONClass();
+			r["pivot"] = wheelPivot == null ? "" : wheelPivot.uid;
+			r["angle"] = F(wheelAngle);
+			r["atoms"] = JSONRaw.Num(wheelAtoms.Count);
+			JSONArray arr = new JSONArray();
+			for (int i = 0; i < wheelAtoms.Count; i++) {
+				if (wheelAtoms[i] != null) arr.Add(wheelAtoms[i].uid);
+			}
+			r["uids"] = arr;
+			return r;
+		}
+
 		public JSONNode AtomMove(JSONNode args) {
 			Atom a = FindAtom(S(args, "uid"));
 			string la = S(args, "action").ToLowerInvariant();
@@ -4174,6 +4918,22 @@ namespace VaMMCP.Api {
 				sub["scale"].Add(F(1f)); sub["scale"].Add(F(1f)); sub["scale"].Add(F(1f));
 				return SetAtomTransform(sub);
 			}
+			if (la == "wheelcreate") {
+				// value = "pivotUid|atomUid;atomUid;..." - remembers the group and
+				// captures its base pose. Rotating the atom CONTAINERS (not their
+				// controls) keeps a rig rigid without touching physics or uids.
+				string spec = S(args, "value");
+				if (spec == "") throw new ApiError("value must be pivotUid|atomUid;atomUid;...");
+				return WheelCreate(spec);
+			}
+			if (la == "wheelangle") return WheelAngle(Num(args, "value", 0f));
+			if (la == "wheelstatus") return WheelStatus();
+			if (la == "parentto") {
+				string parentUid = S(args, "value");
+				if (parentUid == "") throw new ApiError("value must be the parent atom uid");
+				return ParentAtomTo(a, FindAtom(parentUid));
+			}
+			if (la == "unparent") return UnparentAtom(a);
 			if (la == "alignto") {
 				Atom target = FindAtom(S(args, "target_uid"));
 				JSONNode sub = new JSONClass();
@@ -5365,6 +6125,42 @@ namespace VaMMCP.Api {
 			return sb.ToString();
 		}
 
+		/// <summary>Pull compiler error text out of the eval ScriptDomain via reflection
+		/// (members vary between DynamicCSharp versions; probe by name).</summary>
+		private static string CompileErrorsString(DynamicCSharp.ScriptDomain domain) {
+			try {
+				System.Text.StringBuilder sb = new System.Text.StringBuilder();
+				foreach (System.Reflection.FieldInfo fi in domain.GetType().GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static)) {
+					object v = null;
+					try { v = fi.GetValue(fi.IsStatic ? null : domain); } catch { }
+					if (v == null) continue;
+					string s = v.ToString();
+					if (s == null) continue;
+					if (s.Contains("error") || s.Contains("Error") || s.Contains("Exception") || fi.Name.ToLowerInvariant().Contains("err") || fi.Name.ToLowerInvariant().Contains("result")) {
+						sb.Append(fi.Name).Append('=').Append(Trunc(s, 400)).Append("; ");
+					}
+				}
+				foreach (System.Reflection.PropertyInfo pi in domain.GetType().GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static)) {
+					object v = null;
+					try { v = pi.GetValue(domain, null); } catch { }
+					if (v == null) continue;
+					string s = v.ToString();
+					if (s.Contains("error") || s.Contains("Error") || s.Contains("Exception") || pi.Name.ToLowerInvariant().Contains("err") || pi.Name.ToLowerInvariant().Contains("result")) {
+						sb.Append(pi.Name).Append('=').Append(Trunc(s, 400)).Append("; ");
+					}
+				}
+				return sb.Length > 0 ? Trunc(sb.ToString(), 800) : "(no error-ish fields)";
+			} catch (Exception e) {
+				return "errprobe: " + e.Message;
+			}
+		}
+
+		private static string Trunc(string s, int n) {
+			if (s == null) return "";
+			s = s.Length > n ? s.Substring(0, n) : s;
+			return s;
+		}
+
 		public JSONNode EvalCs(JSONNode args) {
 			string code = S(args, "code");
 			if (code == "") throw new ApiError("code required");
@@ -5373,7 +6169,7 @@ namespace VaMMCP.Api {
 			DynamicCSharp.ScriptProxy proxy;
 			if (!evalCache.TryGetValue(source, out proxy)) {
 				DynamicCSharp.ScriptType type = domain.CompileAndLoadScriptSource(source);
-				if (type == null) throw new ApiError("eval compilation failed (see VaM output_log.txt for compiler errors)");
+				if (type == null) throw new ApiError("eval compilation failed: " + CompileErrorsString(domain));
 				proxy = type.CreateInstance();
 				if (proxy == null) throw new ApiError("eval failed to instantiate compiled type");
 				evalCache[source] = proxy;
@@ -5428,5 +6224,127 @@ namespace VaMMCP.Api {
 			}
 			return new JSONData(o.ToString());
 		}
-	}
+
+		// ---------- consolidated action dispatchers ----------
+		public JSONNode ClothingAction(JSONNode args) {
+			string la = S(args, "action").ToLowerInvariant();
+			if (la == "list_presets" || la == "listpresets" || la == "listpresets") return ListClothingPresets(args);
+			if (la == "list_items" || la == "listitems" || la == "list") return ListClothingItems(args);
+			if (la == "load_preset" || la == "loadpreset" || la == "load") return LoadClothingPreset(args);
+			if (la == "add_item" || la == "additem" || la == "add") return AddClothingItem(args);
+			if (la == "remove_item" || la == "removeitem" || la == "remove") return RemoveClothingItem(args);
+			if (la == "set_item_on" || la == "setitemon" || la == "on" || la == "off") return SetClothingItemOn(args);
+			if (la == "open_tab" || la == "opentab" || la == "openclothingtab") return OpenClothingTab(args);
+			if (la == "list_item_morphs" || la == "listgarmentmorphs") return GarmentMorphs(args, null);
+			if (la == "set_item_morph" || la == "setgarmentmorph") return SetGarmentMorph(args);
+			throw new ApiError("unknown clothing action: " + la);
+		}
+		public JSONNode HairAction(JSONNode args) {
+			string la = S(args, "action").ToLowerInvariant();
+			if (la == "list_presets" || la == "listpresets" || la == "list") return ListHairPresets(args);
+			if (la == "list_items" || la == "listitems") return ListHairItems(args);
+			if (la == "load_preset" || la == "loadpreset" || la == "load") return LoadHairPreset(args);
+			if (la == "add_item" || la == "additem" || la == "add") return AddHairItem(args);
+			if (la == "remove_item" || la == "removeitem" || la == "remove") return RemoveHairItem(args);
+			if (la == "set_item_on" || la == "setitemon" || la == "on" || la == "off") return SetHairItemOn(args);
+			throw new ApiError("unknown hair action: " + la);
+		}
+		public JSONNode MorphAction(JSONNode args) {
+			string la = S(args, "action").ToLowerInvariant();
+			if (la == "list" || la == "search" || la == "") return ListMorphs(args);
+			if (la == "set" || la == "setmorph") return SetMorph(args);
+			if (la == "reset" || la == "resetmorphs") return ResetMorphs(args);
+			if (la == "get" || la == "getmorph") return GetMorph(args);
+			throw new ApiError("unknown morph action: " + la);
+		}
+		public JSONNode ExpressionAction(JSONNode args) {
+			string la = S(args, "action").ToLowerInvariant();
+			if (la == "list" || la == "") return ListExpressions(args);
+			if (la == "set" || la == "setexpression") return SetExpression(args);
+			throw new ApiError("unknown expression action: " + la);
+		}
+		public JSONNode PoseAction(JSONNode args) {
+			string la = S(args, "action").ToLowerInvariant();
+			if (la == "list" || la == "") return ListPoses(args);
+			if (la == "load" || la == "loadpose") return LoadPose(args);
+			if (la == "save" || la == "savepose") return SavePose(args);
+			if (la == "savefull" || la == "savefullpreset") return SaveFullPreset(args);
+			throw new ApiError("unknown pose action: " + la);
+		}
+		public JSONNode TriggerActionAll(JSONNode args) {
+			string la = S(args, "action").ToLowerInvariant();
+			if (la == "list" || la == "") return ListTriggers(args);
+			if (la == "create" || la == "createtrigger") return CreateTrigger(args);
+			return TriggerAction(args);
+		}
+		public JSONNode PhysicsAction(JSONNode args) {
+			string la = S(args, "action").ToLowerInvariant();
+			if (la == "list" || la == "listobjects" || la == "") return ListPhysicsObjects(args);
+			if (la == "create_joint" || la == "createjoint" || la == "joint") return CreatePhysicsJoint(args);
+			return PhysicsObjectAction(args);
+		}
+		public JSONNode LightActionAll(JSONNode args) {
+			string la = S(args, "action").ToLowerInvariant();
+			if (la == "list" || la == "") return ListLights(args);
+			return LightAction(args);
+		}
+		public JSONNode AudioAction(JSONNode args) {
+			string la = S(args, "action").ToLowerInvariant();
+			if (la == "list_sources" || la == "listsources" || la == "list") return ListAudioSources(args);
+			if (la == "list_clips" || la == "listclips") return ListAudioClips(args);
+			return AudioSourceAction(args);
+		}
+		public JSONNode PluginAction(JSONNode args) {
+			string la = S(args, "action").ToLowerInvariant();
+			if (la == "list" || la == "") return ListPlugins(args);
+			if (la == "add" || la == "addplugin") return AddPlugin(args);
+			if (la == "remove" || la == "removeplugin") return RemovePlugin(args);
+			throw new ApiError("unknown plugin action: " + la);
+		}
+		public JSONNode HubAction(JSONNode args) {
+			string la = S(args, "action").ToLowerInvariant();
+			if (la == "browse" || la == "") return HubBrowse(args);
+			if (la == "detail" || la == "hubdetail") return HubDetail(args);
+			if (la == "download" || la == "hubdownload") return HubDownload(args);
+			throw new ApiError("unknown hub action: " + la);
+		}
+		public JSONNode CameraAction(JSONNode args) {
+			string la = S(args, "action").ToLowerInvariant();
+			// get/set/aim/capture default to the independent MCP camera; pass
+			// camera="editor" (or editor=true) to drive the user's editor camera.
+			if (la == "get" || la == "getcamera" || la == "")
+				return WantsEditorCamera(args) ? GetCamera() : McPCameraGet(args);
+			if (la == "set" || la == "setcamera")
+				return WantsEditorCamera(args) ? SetCamera(args) : McPCameraSet(args);
+			if (la == "aim" || la == "aimcamera") return AimCamera(args);
+			if (la == "capture" || la == "captureview") return CaptureView(args);
+			if (la == "mcp_create" || la == "mcpcreate") return McPCameraCreate(args);
+			if (la == "mcp_get" || la == "mcpget") return McPCameraGet(args);
+			if (la == "mcp_set" || la == "mcpset") return McPCameraSet(args);
+			if (la == "mcp_capture" || la == "mcpcapture") return McPCameraCapture(args);
+			throw new ApiError("unknown camera action: " + la);
+		}
+		public JSONNode SimulationAction(JSONNode args) {
+			string la = S(args, "action").ToLowerInvariant();
+			if (la == "set" || la == "setsimulation" || la == "") return SetSimulation(args);
+			if (la == "reset" || la == "resetsimulation") return ResetSimulation();
+			throw new ApiError("unknown simulation action: " + la);
+		}
+		public JSONNode CUAActionAll(JSONNode args) {
+			string la = S(args, "action").ToLowerInvariant();
+			if (la == "list" || la == "") return ListCUA(args);
+			return CUAAction(args);
+		}
+		public JSONNode AnimationAction(JSONNode args) {
+			string la = S(args, "action").ToLowerInvariant();
+			if (la == "list_patterns" || la == "listpatterns" || la == "list") return ListAnimationPatterns(args);
+			if (la == "list_steps" || la == "liststeps") return ListAnimationSteps(args);
+			if (la == "create_pattern" || la == "createpattern") return CreateAnimationPattern(args);
+			if (la == "create_step" || la == "createstep") return CreateAnimationStep(args);
+			if (la == "record" || la == "recordsceneanimation") return RecordSceneAnimation(args);
+			if (la == "pattern" || la == "pattern_action") return AnimationPatternAction(args);
+			if (la == "step" || la == "step_action") return AnimationStepAction(args);
+			throw new ApiError("unknown animation action: " + la);
+		}
 }
+	}

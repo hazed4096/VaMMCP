@@ -1,6 +1,8 @@
 using System;
+using System.Reflection;
 using BepInEx;
 using BepInEx.Configuration;
+using HarmonyLib;
 using UnityEngine;
 using VaMMCP.Mcp;
 
@@ -8,8 +10,6 @@ namespace VaMMCP {
 	[BepInPlugin("com.vammcp.core", "VaMMCP", "1.1.0")]
 	public class Plugin : BaseUnityPlugin {
 		public static Plugin instance;
-		/// <summary>ManagedThreadId of the Unity main thread, captured in Awake so the
-		/// dispatcher can run nested Mt.Run calls inline instead of deadlocking on them.</summary>
 		public static int mainThreadId;
 		public static ConfigEntry<bool> cfgEnabled;
 		public static ConfigEntry<int> cfgPort;
@@ -17,12 +17,6 @@ namespace VaMMCP {
 		public static ConfigEntry<int> cfgEvalTimeoutSec;
 		public static ConfigEntry<bool> cfgKeepAliveBackground;
 
-		/// <summary>Main-thread frame counter, incremented once per Update() call.
-		/// Worker threads (e.g. performance_profile) must poll this instead of
-		/// Time.frameCount: Unity's static frame info is unreliable to read from
-		/// off the main thread, while this counter is a plain volatile int that
-		/// every frame publishes. Stops advancing when the player loop stops
-		/// (minimized window), which is exactly what the profiler should observe.</summary>
 		public static volatile int frameTick;
 
 		private MainThreadDispatcher dispatcher;
@@ -34,13 +28,43 @@ namespace VaMMCP {
 			Log.Init(Logger);
 
 			cfgEnabled = Config.Bind("Server", "Enabled", true, "Start the MCP HTTP server when VaM launches");
-			cfgPort = Config.Bind("Server", "Port", 9837, "Port for the MCP Streamable HTTP endpoint (bound to 127.0.0.1 only)");
+			cfgPort = Config.Bind("Port", "Port", 9837, "Port for the MCP Streamable HTTP endpoint (bound to 127.0.0.1 only)");
 			cfgAllowEval = Config.Bind("Security", "AllowEval", false, "Enable the eval_cs tool (runs arbitrary C# inside the VaM process). Only enable on trusted machines.");
 			cfgEvalTimeoutSec = Config.Bind("Security", "EvalTimeoutSec", 30, "Timeout for eval_cs executions");
 			cfgKeepAliveBackground = Config.Bind("Server", "KeepAliveBackground", true,
-				"Keep Unity's player loop running when the VaM window loses focus (runInBackground stays true, Windows power/EcoQoS throttling disabled for this process). IdleSaver still caps the FPS, so the resource cost is small - but MCP tools that wait on the main thread (atom creation, plugins, clothing) no longer stall for minutes while VaM sits unfocused on another monitor/desktop.");
+				"Keep Unity's player loop running when the VaM window loses focus");
 
 			dispatcher = new MainThreadDispatcher();
+
+			// Patch VaM's scene-load crash paths
+			try {
+				var harmony = new Harmony("com.vammcp.safeload");
+				var scType = typeof(SuperController);
+				var dazType = Type.GetType("DAZCharacterSelector, Assembly-CSharp");
+				if (dazType != null) {
+					var om = dazType.GetMethod("OptimizeMemory", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static);
+					if (om != null) {
+						harmony.Patch(om, prefix: new HarmonyMethod(typeof(Plugin).GetMethod("SkipDuringLoad", BindingFlags.Public | BindingFlags.Static)));
+						Log.Info("VaMMCP: patched DAZCharacterSelector.OptimizeMemory");
+					}
+				}
+			// Find and patch SuperController.Load / LoadMerge to repair atom list BEFORE loading
+			var allMethods = scType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static);
+			foreach (var m in allMethods) {
+				if (m.Name.Equals("Load", StringComparison.OrdinalIgnoreCase) ||
+				    m.Name.Equals("LoadMerge", StringComparison.OrdinalIgnoreCase) ||
+				    m.Name.Equals("LoadInternal", StringComparison.OrdinalIgnoreCase)) {
+					try {
+						harmony.Patch(m, prefix: new HarmonyMethod(typeof(Plugin).GetMethod("RepairBeforeLoad", BindingFlags.Public | BindingFlags.Static)));
+						Log.Info("VaMMCP: patched " + m.Name + " (" + m.GetParameters().Length + " params)");
+					} catch (Exception e) {
+						Log.Warn("VaMMCP: failed to patch " + m.Name + ": " + e.Message);
+					}
+				}
+			}
+			} catch (Exception e) {
+				Log.Error("VaMMCP: harmony patch failed: " + e);
+			}
 
 			if (cfgKeepAliveBackground.Value) {
 				ApplyKeepAlive();
@@ -54,36 +78,16 @@ namespace VaMMCP {
 				} catch (Exception e) {
 					Log.Error("VaMMCP failed to start the MCP server: " + e);
 				}
-			} else {
-				Log.Info("VaMMCP loaded but the MCP server is disabled (Server.Enabled=false).");
 			}
 		}
 
 		private void Update() {
 			frameTick++;
-			// Defeat anything that resets the background-run flag (VaM itself sets
-			// it false somewhere; measured live: even with UiPatch forcing it true
-			// at plugin Init, an unfocused window stopped ticking entirely).
+			try { VaMMCP.Api.VaMApi.LoaderWatchdog(); } catch (Exception e) { Log.Debug("loader watchdog: " + e.Message); }
+			try { if (Time.unscaledTime < VaMMCP.Api.VaMApi.HideScreenshotPromptUntil) VaMMCP.Api.VaMApi.HideScreenshotPrompt(); } catch { }
 			if (cfgKeepAliveBackground != null && cfgKeepAliveBackground.Value) {
 				if (!Application.runInBackground) {
 					Application.runInBackground = true;
-					Log.Info("VaMMCP: re-enabled Application.runInBackground (something reset it)");
-				}
-				// A fullscreen (exclusive) player STOPS its whole loop on focus loss -
-				// that is why an idle VaM sat at ~0.25 fps, Screen.width collapsed to
-				// <=1 (IdleSaver read it as "minimized") and every main-thread tool
-				// timed out. Borderless window (FullScreenWindow) keeps the game
-				// covering the whole monitor but keeps the loop alive unfocused.
-				if (!borderlessApplied && Screen.width > 1 && Screen.fullScreen &&
-					Screen.fullScreenMode != FullScreenMode.FullScreenWindow) {
-					try {
-						Screen.fullScreenMode = FullScreenMode.FullScreenWindow;
-						borderlessApplied = true;
-						Log.Info("VaMMCP: display switched to borderless window (FullScreenWindow) so the player loop keeps running when VaM is unfocused");
-					} catch (Exception e) {
-						borderlessApplied = true;
-						Log.Info("VaMMCP: borderless switch failed: " + e.Message);
-					}
 				}
 			}
 			if (dispatcher != null) {
@@ -91,24 +95,37 @@ namespace VaMMCP {
 			}
 		}
 
-		private bool borderlessApplied;
+		public static bool RepairBeforeLoad() {
+			try {
+				VaMMCP.Api.VaMApi.LoaderWatchdog();
+			} catch (Exception e) {
+				Log.Debug("RepairBeforeLoad: " + e.Message);
+			}
+			return true; // continue with original Load
+		}
 
-		/// <summary>Ensure the player keeps its loop when unfocused. On this desktop
-		// build the EcoQoS disable API (SetProcessInformation / ProcessPowerThrottling)
-		// returned ERROR_BAD_LENGTH and is not usable, so nothing to do there: the
-		// fixes that actually matter are runInBackground + borderless display mode,
-		// handled in Update().</summary>
+		public static bool SkipDuringLoad() {
+			try {
+				var sc = SuperController.singleton;
+				if (sc == null) return true;
+				var fi = typeof(SuperController).GetField("_isLoading", BindingFlags.NonPublic | BindingFlags.Instance);
+				if (fi == null) return true;
+				object v = fi.GetValue(sc);
+				if (v is bool && (bool)v) return false;
+			} catch { }
+			return true;
+		}
+
+		private bool borderlessApplied;
+		private int watchdogTick;
+
 		private void ApplyKeepAlive() {
-			try { Application.runInBackground = true; Log.Info("VaMMCP: keepalive on (runInBackground=true, borderless pending first frame)"); } catch { }
+			try { Application.runInBackground = true; } catch { }
 		}
 
 		private void OnDestroy() {
 			if (httpServer != null) {
-				try {
-					httpServer.Stop();
-				} catch (Exception e) {
-					Log.Debug("stop: " + e.Message);
-				}
+				try { httpServer.Stop(); } catch (Exception e) { Log.Debug("stop: " + e.Message); }
 			}
 		}
 	}
