@@ -869,7 +869,9 @@ namespace VaMMCP.Api {
 
 		private static int CountComponents<T>(Atom a) where T : Component {
 			try {
-				T[] cs = a.GetComponentsInChildren<T>(true);
+				// A CustomUnityAsset's mesh lives under mainController, not the atom root.
+				Transform root = a.mainController != null ? a.mainController.transform : a.transform;
+				T[] cs = root.GetComponentsInChildren<T>(true);
 				return cs == null ? 0 : cs.Length;
 			} catch { return 0; }
 		}
