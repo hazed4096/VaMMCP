@@ -869,10 +869,16 @@ namespace VaMMCP.Api {
 
 		private static int CountComponents<T>(Atom a) where T : Component {
 			try {
-				// A CustomUnityAsset's mesh lives under mainController, not the atom root.
-				Transform root = a.mainController != null ? a.mainController.transform : a.transform;
-				T[] cs = root.GetComponentsInChildren<T>(true);
-				return cs == null ? 0 : cs.Length;
+				// CustomUnityAsset meshes live under mainController, person meshes under
+				// the atom root - take whichever subtree actually has components.
+				T[] atRoot = a.transform.GetComponentsInChildren<T>(true);
+				int nRoot = atRoot == null ? 0 : atRoot.Length;
+				int nMain = 0;
+				if (a.mainController != null) {
+					T[] atMain = a.mainController.transform.GetComponentsInChildren<T>(true);
+					nMain = atMain == null ? 0 : atMain.Length;
+				}
+				return nRoot > nMain ? nRoot : nMain;
 			} catch { return 0; }
 		}
 
@@ -980,11 +986,24 @@ namespace VaMMCP.Api {
 					row["worn"] = wornArr;
 					DAZHairGroup[] hairs = sel.hairItems;
 					int hairsOn = 0;
-					if (hairs != null) for (int i = 0; i < hairs.Length; i++) if (hairs[i] != null && hairs[i].active) hairsOn++;
+					JSONArray hairArr = new JSONArray();
+					if (hairs != null) for (int i = 0; i < hairs.Length; i++) if (hairs[i] != null && hairs[i].active) { hairsOn++; hairArr.Add(hairs[i].uid); }
 					row["hairItemsOn"] = JSONRaw.Num(hairsOn);
+					row["hairs"] = hairArr;
 				}
 			} catch { }
 			row["renderers"] = JSONRaw.Num(CountComponents<Renderer>(p));
+			int rendOn = 0, hairToolOn = 0;
+			try {
+				Renderer[] rrs = p.transform.GetComponentsInChildren<Renderer>(true);
+				if (rrs != null) for (int i = 0; i < rrs.Length; i++) {
+					if (rrs[i] == null || !rrs[i].enabled) continue;
+					rendOn++;
+					if (rrs[i].sharedMaterial != null && rrs[i].sharedMaterial.name.IndexOf("HairTool", StringComparison.OrdinalIgnoreCase) >= 0) hairToolOn++;
+				}
+			} catch { }
+			row["renderersOn"] = JSONRaw.Num(rendOn);
+			if (hairToolOn > 0) row["hairToolRenderersOn"] = JSONRaw.Num(hairToolOn);
 			row["colliders"] = JSONRaw.Num(CountComponents<Collider>(p));
 			row["rigidbodies"] = JSONRaw.Num(CountComponents<Rigidbody>(p));
 			string sub = SubSceneOf(p);
@@ -1008,8 +1027,9 @@ namespace VaMMCP.Api {
 				int n = counts[a.type] == null ? 0 : counts[a.type].AsInt;
 				counts[a.type] = JSONRaw.Num(n + 1);
 				if (a.type == "Person") people.Add(a);
-				if (a.type != "CoreControl" && a.type != "InvisibleLight" && a.type != "VRController" &&
-					a.type != "WindowCamera" && a.type != "PlayerNavigationPanel" && a.type != "Empty")
+				// Only flag atoms that are expected to draw something: persons and asset
+				// atoms. UI buttons / force / light atoms legitimately have no renderers.
+				if (a.type == "Person" || a.type == "CustomUnityAsset")
 					if (CountComponents<Renderer>(a) == 0) noRenderers.Add(a.uid);
 				if (!Finite(a.transform.position) || !Finite(a.transform.eulerAngles)) nonFinite.Add(a.uid);
 			}
