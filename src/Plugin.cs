@@ -7,7 +7,7 @@ using UnityEngine;
 using VaMMCP.Mcp;
 
 namespace VaMMCP {
-	[BepInPlugin("com.vammcp.core", "VaMMCP", "1.1.0")]
+	[BepInPlugin("com.vammcp.core", "VaMMCP", "1.1.1")]
 	public class Plugin : BaseUnityPlugin {
 		public static Plugin instance;
 		public static int mainThreadId;

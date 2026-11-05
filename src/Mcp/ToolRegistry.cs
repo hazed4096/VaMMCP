@@ -22,6 +22,16 @@ namespace VaMMCP.Mcp {
 				.Fn(api.LoadScene));
 			tools.Add(new Tool("new_scene", "Start a new empty scene. Warning: discards the current scene.")
 				.Fn(a => api.NewScene()));
+
+			// Loader diagnostics: the private atoms Dictionary vs atomsList vs
+			// startingAtoms counts and every entry that is dead / duplicated /
+			// not resolvable. A List.Count > Dictionary.Count aborts VaM's load
+			// with "Destination array was not long enough" and wedges it.
+			tools.Add(new Tool("atom_info", "Loader diagnostics: atoms dict/list/startingAtoms counts and anomalies (dead, duplicate uid, missing from dict).")
+				.Fn(a => api.AtomInfo(a)));
+			tools.Add(new Tool("loader_heal", "Repair the loader-wedge state without restarting VaM: rebuild atomsList from the atoms dict, prune dead startingAtoms entries, clear stuck _isLoading.")
+				.P("clearLoading", "boolean", "Clear the stuck _isLoading flag (default true)", false)
+				.Fn(a => api.LoaderHeal(a)));
 			tools.Add(new Tool("save_scene", "Save the current scene to Saves/scene.")
 				.P("path", "string", "Optional save path (default Saves/scene/VaMMCP_<timestamp>.json)", false)
 				.Fn(api.SaveScene));
@@ -92,114 +102,47 @@ namespace VaMMCP.Mcp {
 				.P("name", "string", "Character name", true)
 				.Fn(api.SetCharacter));
 
-			// ---------- morphs (捏人) ----------
-			tools.Add(new Tool("list_morphs", "Search body/face morphs of a person. Returns name, uid, region, group and current value. The morphs ARE the character sliders.")
+// ---------- morphs (捏人) ----------
+			tools.Add(new Tool("morph_action", "Morphs: list/search, set, reset, get.")
 				.P("person", "string", "Person uid (default: first Person)", false)
-				.P("search", "string", "Substring filter on morph name or uid", false)
-				.P("region", "string", "Exact region filter (e.g. Face, Body)", false)
-				.P("group", "string", "Exact group filter", false)
-				.P("limit", "number", "Max results (default 500)", false)
-				.Fn(api.ListMorphs));
-			tools.Add(new Tool("set_morph", "Set a morph value on a person (e.g. breast size, face shape). Typical range -1..1.")
+				.P("action", "string", "Action: list, set, reset, get", true)
+				.P("name", "string", "Morph name/uid (for set/get)", false)
+				.P("value", "number", "Morph value (for set)", false)
+				.P("region", "string", "Region filter (for list/reset)", false)
+				.P("search", "string", "Search filter (for list)", false)
+				.P("group", "string", "Group filter (for list)", false)
+				.P("limit", "number", "Max results (for list)", false)
+				.Fn(api.MorphAction));
+// ---------- clothing / hair ----------
+			tools.Add(new Tool("clothing_action", "Clothing: list_presets, list_items, load_preset, add_item, remove_item, set_item_on, open_tab.")
 				.P("person", "string", "Person uid (default: first Person)", false)
-				.P("name", "string", "Morph display name or uid from list_morphs", true)
-				.P("value", "number", "Morph value, typically -1..1", true)
-				.Fn(api.SetMorph));
-			tools.Add(new Tool("get_morph", "Read a morph value on a person.")
+				.P("action", "string", "Action", true)
+				.P("path", "string", "Preset/item path", false)
+				.P("uid", "string", "Item uid", false)
+				.P("on", "boolean", "On/off for set_item_on", false)
+				.P("search", "string", "Search filter", false)
+				.Fn(api.ClothingAction));
+			tools.Add(new Tool("hair_action", "Hair: list_presets, list_items, load_preset, add_item, remove_item, set_item_on.")
 				.P("person", "string", "Person uid (default: first Person)", false)
-				.P("name", "string", "Morph display name or uid", true)
-				.Fn(api.GetMorph));
-			tools.Add(new Tool("reset_morphs", "Reset morphs of a person to 0 (optionally only one region).")
+				.P("action", "string", "Action", true)
+				.P("path", "string", "Preset/item path", false)
+				.P("uid", "string", "Item uid", false)
+				.P("on", "boolean", "On/off for set_item_on", false)
+				.P("search", "string", "Search filter", false)
+				.Fn(api.HairAction));
+// ---------- poses / expressions ----------
+			tools.Add(new Tool("pose_action", "Poses: list, load, save, save_full.")
 				.P("person", "string", "Person uid (default: first Person)", false)
-				.P("region", "string", "Optional region to reset only (e.g. Face)", false)
-				.Fn(api.ResetMorphs));
-
-			// ---------- clothing / hair ----------
-			tools.Add(new Tool("list_packages", "List installed .var packages (their asset paths are usable in load_clothing_preset / load_hair_preset / add_clothing_item / add_hair_item).")
-				.Fn(a => api.ListPackages(a)));
-			tools.Add(new Tool("list_clothing_presets", "List clothing presets/items on disk AND inside all .var packages (path may be a package path like 'Package.1:/Custom/Clothing/...').")
-				.P("search", "string", "Optional substring filter", false)
-				.Fn(api.ListClothingPresets));
-			tools.Add(new Tool("load_clothing_preset", "Apply a clothing preset to a person.")
-				.P("path", "string", "Preset path from list_clothing_presets", true)
+				.P("action", "string", "Action: list, load, save, savefull", true)
+				.P("path", "string", "Pose path", false)
+				.P("name", "string", "Pose name", false)
+				.Fn(api.PoseAction));
+			tools.Add(new Tool("expression_action", "Expressions: list, set.")
 				.P("person", "string", "Person uid (default: first Person)", false)
-				.Fn(api.LoadClothingPreset));
-			tools.Add(new Tool("list_clothing_items", "List the clothing a person is actually wearing (uid/name/active), plus a 'worn' summary and libraryCount. Pass all=true to dump the whole clothing library, including items that are not worn.")
-				.P("person", "string", "Person uid (default: first Person)", false)
-				.P("all", "boolean", "true = include unworn library items (default false: worn only)", false)
-				.Fn(api.ListClothingItems));
-			tools.Add(new Tool("add_clothing_item", "Add a clothing item to a person from its .vam/.json path (package paths work, e.g. from list_clothing_presets). Blocks until VaM confirms the item exists and is worn, and returns ok=false with a hint when the runtime clothing creator is not initialised (open Person > Clothing once in VaM).")
-				.P("path", "string", "Clothing item .vam/.json path", true)
-				.P("person", "string", "Person uid (default: first Person)", false)
-				.P("wait_seconds", "number", "How long to wait for the async load (default 20)", false)
-				.Timeout(60000).Poller()
-				.Fn(api.AddClothingItem));
-			tools.Add(new Tool("open_clothing_tab", "Initialise a person's runtime clothing creator (the equivalent of opening that person's Person > Clothing tab once in VaM). Without this, add_clothing_item silently no-ops because VaM never builds the DAZRuntimeCreator on the creator item. Must be re-run after every scene load.")
-				.P("person", "string", "Person uid (default: first Person)", false)
-				.P("wait_seconds", "number", "How long to wait for the creator to initialise (default 15)", false)
-				.Timeout(60000).Poller()
-				.Fn(api.OpenClothingTab));
-			tools.Add(new Tool("remove_clothing_item", "Remove a clothing item from a person.")
-				.P("id", "string", "Clothing item uid from list_clothing_items", true)
-				.P("person", "string", "Person uid (default: first Person)", false)
-				.Fn(api.RemoveClothingItem));
-			tools.Add(new Tool("set_clothing_item_on", "Show or hide a clothing item.")
-				.P("id", "string", "Clothing item uid", true)
-				.P("on", "boolean", "true to wear, false to hide", true)
-				.P("person", "string", "Person uid (default: first Person)", false)
-				.Fn(api.SetClothingItemOn));
-			tools.Add(new Tool("list_hair_presets", "List hair presets/items on disk AND inside all .var packages (path may be a package path).")
-				.P("search", "string", "Optional substring filter", false)
-				.Fn(api.ListHairPresets));
-			tools.Add(new Tool("load_hair_preset", "Apply a hair preset to a person.")
-				.P("path", "string", "Preset path from list_hair_presets", true)
-				.P("person", "string", "Person uid (default: first Person)", false)
-				.Fn(api.LoadHairPreset));
-			tools.Add(new Tool("list_hair_items", "List hair items currently on a person.")
-				.P("person", "string", "Person uid (default: first Person)", false)
-				.Fn(api.ListHairItems));
-			tools.Add(new Tool("add_hair_item", "Add a hair item to a person from its .vam/.json path (package paths work, e.g. from list_hair_presets). Waits for the character to be ready; loads asynchronously.")
-				.P("path", "string", "Hair item .vam/.json path", true)
-				.P("person", "string", "Person uid (default: first Person)", false)
-				.Timeout(60000).Poller()
-				.Fn(api.AddHairItem));
-			tools.Add(new Tool("remove_hair_item", "Remove a hair item from a person.")
-				.P("id", "string", "Hair item uid from list_hair_items", true)
-				.P("person", "string", "Person uid (default: first Person)", false)
-				.Fn(api.RemoveHairItem));
-			tools.Add(new Tool("set_hair_item_on", "Show or hide a hair item.")
-				.P("id", "string", "Hair item uid", true)
-				.P("on", "boolean", "true to show, false to hide", true)
-				.P("person", "string", "Person uid (default: first Person)", false)
-				.Fn(api.SetHairItemOn));
-
-			// ---------- poses / expressions ----------
-			tools.Add(new Tool("list_poses", "List pose presets on disk.")
-				.P("search", "string", "Optional substring filter", false)
-				.Fn(api.ListPoses));
-			tools.Add(new Tool("load_pose", "Apply a pose preset. With all=true applies to every Person in the scene.")
-				.P("path", "string", "Pose path from list_poses", true)
-				.P("person", "string", "Person uid (default: first Person; ignored when all=true)", false)
-				.P("all", "boolean", "Apply to all persons (default false)", false)
-				.Fn(api.LoadPose));
-			tools.Add(new Tool("save_pose", "Save a person's current pose as a pose preset.")
-				.P("path", "string", "Optional save path (default Saves/Person/Pose/<uid>_<timestamp>.json)", false)
-				.P("person", "string", "Person uid (default: first Person)", false)
-				.Fn(api.SavePose));
-			tools.Add(new Tool("save_full_preset", "Export a person as a full preset (appearance + pose + physics) — equivalent to VaM's 'Save Full'.")
-				.P("path", "string", "Optional save path (default Saves/Person/full/<uid>_<timestamp>.json)", false)
-				.P("person", "string", "Person uid (default: first Person)", false)
-				.Fn(api.SaveFullPreset));
-			tools.Add(new Tool("list_expressions", "List expression-like face morphs of a person with current values.")
-				.P("person", "string", "Person uid (default: first Person)", false)
-				.Fn(api.ListExpressions));
-			tools.Add(new Tool("set_expression", "Set a facial expression: optionally resets all expression morphs first, then sets the named one (default value 1).")
-				.P("person", "string", "Person uid (default: first Person)", false)
-				.P("name", "string", "Expression morph name from list_expressions", true)
-				.P("value", "number", "Morph value (default 1)", false)
-				.P("reset", "boolean", "Reset other expression morphs first (default true)", false)
-				.Fn(api.SetExpression));
-
+				.P("action", "string", "Action: list, set", true)
+				.P("name", "string", "Expression name", false)
+				.P("value", "number", "Expression value", false)
+				.Fn(api.ExpressionAction));
 			// ---------- controls ----------
 			tools.Add(new Tool("list_controls", "List FreeControllerV3 controls of a person (headControl, chestControl, lHandControl, ...).")
 				.P("person", "string", "Person uid (default: first Person)", false)
@@ -230,7 +173,7 @@ namespace VaMMCP.Mcp {
 				.P("person", "string", "Person uid (default: first Person)", false)
 				.P("position", "array", "[x, y, z] world position for hipControl", true)
 				.P("rotation", "array", "[x, y, z] euler angles (omit to keep current)", false)
-				.P("reset", "bool", "reset simulation after the jump (default true; needs ~10 s)", false)
+				.P("reset", "boolean", "reset simulation after the jump (default true; needs ~10 s)", false)
 				.Fn(api.PersonTeleport));
 			tools.Add(new Tool("person_point_at", "Point a person's hand control(s) at a target: rotates lHandControl/rHandControl (positionState/rotationState On) so they aim at the target via LookRotation. Position is untouched - combine with set_control to extend the arm.")
 				.P("person", "string", "Person uid (default: first Person)", false)
@@ -264,7 +207,7 @@ namespace VaMMCP.Mcp {
 				.P("param", "string", "Param name", true)
 				.P("value", "any", "Value to set", true)
 				.P("type", "string", "Optional type override", false)
-				.P("reload", "bool", "For url params: reload the file after setting (default true)", false)
+				.P("reload", "boolean", "For url params: reload the file after setting (default true)", false)
 				.Fn(api.SetParam));
 			tools.Add(new Tool("call_action", "Invoke an action button of a storable (e.g. Reset, Stop, Play).")
 				.P("uid", "string", "Atom uid", true)
@@ -272,149 +215,64 @@ namespace VaMMCP.Mcp {
 				.P("action", "string", "Action name from list_storable_params", true)
 				.Fn(api.CallAction));
 
-			// ---------- camera ----------
-			tools.Add(new Tool("get_camera", "Read the monitor camera position, rotation and FOV.")
-				.Fn(a => api.GetCamera()));
-			tools.Add(new Tool("set_camera", "Move the monitor camera: position, rotation (euler) and/or FOV.")
-				.P("position", "array", "[x, y, z] world position", false)
-				.P("rotation", "array", "[x, y, z] euler angles", false)
-				.P("fov", "number", "Field of view in degrees", false)
-				.Fn(api.SetCamera));
-			tools.Add(new Tool("aim_camera", "Rotate the monitor camera to look at a target without moving it (solves Unity's hand-computed-yaw trap; note yaw 180 views are mirrored: screen-right = -X). Optionally also set position first. Target: 'uid' of any atom (zero-transform subscene atoms fall back to their 'control' FreeControllerV3), or 'person' + optional 'control' (defaults hipControl).")
-				.P("uid", "string", "Atom uid to look at", false)
-				.P("person", "string", "Person uid to look at", false)
-				.P("control", "string", "Control id of the person (default hipControl)", false)
-				.P("position", "array", "Optional new camera position before aiming", false)
-				.P("fov", "number", "Optional FOV (default: keep current)", false)
-				.Fn(api.AimCamera));
-			tools.Add(new Tool("capture_view", "Capture what VaM actually renders on screen to a PNG (default Saves/PluginData/vam-mcp/preview.png) and return its path. mode=window (default) grabs the real back buffer, so person skin/clothing render; it completes at end of the next frame, so the tool polls (up to timeout_ms - idle VaM frames can take seconds). mode=camera does the old RenderTexture re-render of the monitor camera only (fast, but person meshes may be missing). Set return_image=true to also get the picture back inline.")
-				.P("width", "number", "Image width (default 1280, max 4096; window mode scales the full buffer down to this)", false)
-				.P("height", "number", "Image height (default 720, max 4096)", false)
-				.P("path", "string", "Optional output path", false)
-				.P("mode", "string", "'window' (default, full fidelity) or 'camera' (legacy fast re-render)", false)
-				.P("return_image", "boolean", "Return the PNG inline as an MCP image (default false; keep the resolution modest, e.g. 640x360, and note that images above 4 MB stay on disk only)", false)
-				.P("timeout_ms", "number", "How long to wait for the next rendered frame in window mode (default 20000)", false)
-				.Timeout(60000).Poller()
-				.Fn(api.CaptureView));
+// ---------- camera ----------
+			tools.Add(new Tool("camera_action", "Camera: get, set, aim, capture. Uses VaMMCP's OWN camera by default so nothing ever moves the user's editor view; pass camera=\"editor\" (or editor=true) to drive the editor/monitor camera instead. capture modes: mcp (default), editor, window.")
+				.P("action", "string", "Action", true)
+				.P("camera", "string", "mcp (default, own camera) or editor (user's monitor camera)", false)
+				.P("editor", "boolean", "Shorthand for camera=\"editor\"", false)
+				.P("position", "array", "Position [x,y,z]", false)
+				.P("rotation", "array", "Rotation [x,y,z]", false)
+				.P("uid", "string", "Aim target atom uid (capture can aim too)", false)
+				.P("target_uid", "string", "Alias of uid", false)
+				.P("person", "string", "Aim target person uid", false)
+				.P("control", "string", "Person control for the aim target (default hipControl)", false)
+				.P("mode", "string", "Capture mode: mcp (default), editor, window", false)
+				.P("fov", "number", "FOV", false)
+				.P("width", "number", "Capture width", false)
+				.P("height", "number", "Capture height", false)
+				.P("path", "string", "Output path", false)
+				.P("return_image", "boolean", "Inline the PNG as base64", false)
+				.Fn(api.CameraAction));
 
-			// ---------- independent MCP camera ----------
-			tools.Add(new Tool("mcp_camera_create", "Create (once) an independent MCP camera that never touches the editor/monitor view.")
-				.P("position", "array", "[x, y, z] world position", false)
-				.P("rotation", "array", "[x, y, z] euler angles", false)
-				.P("fov", "number", "Field of view in degrees (default 60)", false)
-				.Fn(api.McPCameraCreate));
-			tools.Add(new Tool("mcp_camera_get", "Read the independent MCP camera position, rotation and FOV.")
-				.Fn(api.McPCameraGet));
-			tools.Add(new Tool("mcp_camera_set", "Move/aim the independent MCP camera.")
-				.P("position", "array", "[x, y, z] world position", false)
-				.P("rotation", "array", "[x, y, z] euler angles", false)
-				.P("fov", "number", "Field of view in degrees", false)
-				.Fn(api.McPCameraSet));
-			tools.Add(new Tool("mcp_camera_capture", "Screenshot from the independent MCP camera (never disturbs the editor view).")
-				.P("width", "number", "Image width (default 1280, max 4096)", false)
-				.P("height", "number", "Image height (default 720, max 4096)", false)
-				.P("path", "string", "Optional output path", false)
-				.P("return_image", "boolean", "Return the PNG inline as an MCP image (default false)", false)
-				.P("timeout_ms", "number", "How long to wait for the render (default 20000)", false)
-				.Fn(api.McPCameraCapture));
-
-			// ---------- simulation ----------
-			tools.Add(new Tool("set_simulation", "Pause/resume the simulation or set the global time scale.")
-				.P("paused", "boolean", "true pauses, false resumes", false)
-				.P("timeScale", "number", "Global time scale (1 = normal)", false)
-				.Fn(api.SetSimulation));
-			tools.Add(new Tool("reset_simulation", "Reset the physics simulation (collapses soft-body / cloth jitter).")
-				.Fn(a => api.ResetSimulation()));
-
-			// ---------- scene animation / timeline ----------
-			tools.Add(new Tool("list_animation_patterns", "List AnimationPattern atoms in the scene (each manages a timeline of AnimationSteps).")
-				.P("search", "string", "Optional uid/name filter", false)
-				.Fn(api.ListAnimationPatterns));
-			tools.Add(new Tool("list_animation_steps", "List AnimationStep atoms for a given AnimationPattern.")
-				.P("pattern_uid", "string", "AnimationPattern atom uid", true)
-				.Fn(api.ListAnimationSteps));
-			tools.Add(new Tool("create_animation_pattern", "Create a new AnimationPattern atom (timeline container).")
-				.P("uid", "string", "Optional uid", false)
-				.Timeout(30000).Poller()
-				.Fn(api.CreateAnimationPattern));
-			tools.Add(new Tool("create_animation_step", "Create an AnimationStep atom and attach it to an AnimationPattern.")
-				.P("pattern_uid", "string", "AnimationPattern atom uid", true)
-				.P("uid", "string", "Optional uid", false)
-				.P("transition_type", "string", "Transition type: Linear, Smooth, etc.", false)
-				.P("duration", "number", "Step duration in seconds", false)
-				.Timeout(30000).Poller()
-				.Fn(api.CreateAnimationStep));
-			tools.Add(new Tool("animation_pattern_action", "Control an AnimationPattern: Play, Stop, Pause, Reset, Scrub.")
-				.P("pattern_uid", "string", "AnimationPattern atom uid", true)
-				.P("action", "string", "Action: Play, Stop, Pause, Reset, ScrubToTime, SetTime", true)
-				.P("time", "number", "Time value for ScrubToTime/SetTime", false)
-				.Fn(api.AnimationPatternAction));
-			tools.Add(new Tool("animation_step_action", "Control an AnimationStep: Play, Stop, SetTransition, SetDuration.")
-				.P("step_uid", "string", "AnimationStep atom uid", true)
-				.P("action", "string", "Action: Play, Stop, SetTransition, SetDuration", true)
-				.P("value", "number", "Value for SetTransition (index) or SetDuration (seconds)", false)
-				.Fn(api.AnimationStepAction));
-			tools.Add(new Tool("record_scene_animation", "Start/stop recording a scene animation (records atom transforms to AnimationSteps).")
-				.P("pattern_uid", "string", "AnimationPattern to record into", true)
-				.P("action", "string", "Start or Stop", true)
-				.P("record_physics", "boolean", "Record physics-driven atoms too", false)
-				.Fn(api.RecordSceneAnimation));
-
-			// ---------- triggers ----------
-			tools.Add(new Tool("list_triggers", "List trigger-carrying atoms in the scene (Trigger storables on sliders/buttons/steps).")
-				.P("search", "string", "Optional uid/storable filter", false)
-				.Fn(api.ListTriggers));
-			tools.Add(new Tool("trigger_action", "Fire or configure a trigger: Fire, Reset, SetParams.")
-				.P("trigger_uid", "string", "Trigger atom uid", true)
-				.P("action", "string", "Action: Fire, Reset, SetFloatParam, SetStringParam", true)
-				.P("param", "string", "Parameter name", false)
-				.P("value", "any", "Value to set", false)
-				.Fn(api.TriggerAction));
-			tools.Add(new Tool("create_trigger", "Create a new Trigger atom.")
-				.P("uid", "string", "Optional uid", false)
-				.Timeout(30000).Poller()
-				.Fn(api.CreateTrigger));
-
-			// ---------- physics ----------
-			tools.Add(new Tool("list_physics_objects", "List physics-relevant atoms (their physics-ish storables by name).")
-				.P("search", "string", "Optional uid filter", false)
-				.Fn(api.ListPhysicsObjects));
-			tools.Add(new Tool("physics_object_action", "Control a physics object: Enable/Disable, SetCollision, AddForce, SetMass.")
-				.P("uid", "string", "Physics atom uid", true)
-				.P("action", "string", "Action: EnablePhysics, DisablePhysics, SetCollision, AddForce, SetMass, SetDrag", true)
-				.P("value", "any", "Value for the action", false)
-				.Fn(api.PhysicsObjectAction));
-			tools.Add(new Tool("create_physics_joint", "Create a physics joint between two atoms (ConfigurableJoint, FixedJoint, SpringJoint).")
-				.P("uid", "string", "Optional uid", false)
-				.P("atom_a", "string", "First atom uid", true)
-				.P("atom_b", "string", "Second atom uid", true)
-				.P("joint_type", "string", "ConfigurableJoint, FixedJoint, SpringJoint, HingeJoint", true)
-				.P("anchor", "array", "[x,y,z] local anchor on atom A", false)
-				.P("connected_anchor", "array", "[x,y,z] local anchor on atom B", false)
-				.Timeout(30000).Poller()
-				.Fn(api.CreatePhysicsJoint));
-
-			// ---------- scene lighting / audio / misc ----------
-			tools.Add(new Tool("list_lights", "List Light atoms in the scene with their current settings.")
-				.Fn(api.ListLights));
-			tools.Add(new Tool("light_action", "Control a Light: On/Off, SetColor, SetIntensity, SetRange, SetType.")
-				.P("uid", "string", "Light atom uid", true)
-				.P("action", "string", "Action: Toggle, SetColor, SetIntensity, SetRange, SetType, SetSpotAngle", true)
-				.P("value", "any", "Value (color hex, float, or string for type)", false)
-				.Fn(api.LightAction));
-			tools.Add(new Tool("list_audio_sources", "List AudioSource atoms.")
-				.Fn(api.ListAudioSources));
-			tools.Add(new Tool("list_audio_clips", "List VaM's registered audio clips (embedded package audio + URL clips) with categories; uids work directly as audio_source_action Play clip.")
-				.P("type", "string", "all|embedded|url (default all)", false)
-				.P("category", "string", "Case-insensitive category name filter", false)
-				.P("search", "string", "Substring filter on clip uid/name", false)
-				.Fn(api.ListAudioClips));
-			tools.Add(new Tool("audio_source_action", "Control AudioSource: Play, Stop, Pause, SetClip (also decodes local PCM WAV in-plugin), SetLoop, SetVolume.")
-				.P("uid", "string", "AudioSource atom uid", true)
-				.P("action", "string", "Action: Play, Stop, Pause, SetVolume, SetClip, SetLoop", true)
-				.P("value", "any", "Value for the action", false)
-				.Fn(api.AudioSourceAction));
-
+// ---------- simulation ----------
+			tools.Add(new Tool("simulation_action", "Simulation: set, reset.")
+				.P("action", "string", "Action: set, reset", true)
+				.P("paused", "boolean", "Paused state (for set)", false)
+				.P("timeScale", "number", "Time scale (for set)", false)
+				.Fn(api.SimulationAction));
+// ---------- scene animation / timeline ----------
+			tools.Add(new Tool("animation_action", "Animation: list_patterns, list_steps, create_pattern, create_step, record, pattern action, step action.")
+				.P("action", "string", "Action", true)
+				.P("pattern_uid", "string", "Pattern atom uid", false)
+				.P("step_uid", "string", "Step uid", false)
+				.P("name", "string", "Name", false)
+				.P("time", "number", "Time", false)
+				.Fn(api.AnimationAction));
+// ---------- triggers ----------
+			tools.Add(new Tool("trigger_action", "Triggers: list, action, create.")
+				.P("action", "string", "Action: list, create, or trigger action name", true)
+				.P("uid", "string", "Trigger uid", false)
+				.P("name", "string", "Trigger name", false)
+				.Fn(api.TriggerActionAll));
+// ---------- physics ----------
+			tools.Add(new Tool("physics_action", "Physics: list_objects, action, create_joint.")
+				.P("action", "string", "Action", true)
+				.P("uid", "string", "Physics object uid", false)
+				.P("name", "string", "Name", false)
+				.Fn(api.PhysicsAction));
+// ---------- scene lighting / audio / misc ----------
+			tools.Add(new Tool("light_action", "Lights: list, action (toggle/set color/intensity/range/angle/type).")
+				.P("uid", "string", "Light atom uid", false)
+				.P("action", "string", "Action", true)
+				.P("color", "string", "Color", false)
+				.P("value", "number", "Intensity/range/angle", false)
+				.Fn(api.LightActionAll));
+			tools.Add(new Tool("audio_action", "Audio: list_sources, list_clips, source action.")
+				.P("uid", "string", "Audio source uid", false)
+				.P("action", "string", "Action", true)
+				.P("name", "string", "Clip name", false)
+				.P("value", "number", "Volume/pitch", false)
+				.Fn(api.AudioAction));
 			// ---------- user preferences ----------
 			tools.Add(new Tool("get_user_preferences", "Get current UserPreferences (graphics, performance, VR, navigation, security, etc.).")
 				.P("category", "string", "Optional category filter", false)
@@ -435,17 +293,12 @@ namespace VaMMCP.Mcp {
 				.Fn(api.TemplateBrowser));
 
 			// ---------- atom UI (control, move, geometry, physics) ----------
-			tools.Add(new Tool("atom_control", "Control atom state: Select, FreezePhysics, DisableRender, DisableCollision, EndIsolate, LoadUserDefaults (apply the atom's user-default preset).")
+			tools.Add(new Tool("atom_action", "Atom control/move: Select, FreezePhysics, DisableRender, DisableCollision, EndIsolate, LoadUserDefaults, SetPosition, SetRotation, SetScale, SnapToGround, AlignTo, ResetTransform, ParentTo (value = parent atom uid, e.g. a SubScene), Unparent.")
 				.P("uid", "string", "Atom uid", true)
-				.P("action", "string", "Action: Select, FreezePhysics, DisableCollision, EndIsolate, LoadUserDefaults, ...", true)
-				.P("value", "any", "Optional value (e.g. value=false on FreezePhysics to unfreeze)", false)
-				.Fn(api.AtomControl));
-			tools.Add(new Tool("atom_move", "Move atom with gizmo: SetPosition, SetRotation, SetScale, SnapToGround, AlignTo.")
-				.P("uid", "string", "Atom uid", true)
-				.P("action", "string", "Action: SetPosition, SetRotation, SetScale, SnapToGround, AlignTo, ResetTransform", true)
+				.P("action", "string", "Action", true)
 				.P("target_uid", "string", "Target atom for AlignTo", false)
-				.P("value", "array", "[x,y,z] for position/rotation/scale", false)
-				.Fn(api.AtomMove));
+				.P("value", "any", "Optional value (ParentTo: the parent atom uid)", false)
+				.Fn(api.AtomAction));
 			tools.Add(new Tool("atom_geometry_choices", "Get/set atom geometry choices (for CustomUnityAsset, etc.).")
 				.P("uid", "string", "Atom uid", true)
 				.P("action", "string", "Action: List, Select", true)
@@ -459,15 +312,12 @@ namespace VaMMCP.Mcp {
 				.P("value", "boolean", "true/false for ArmRecord/PlaybackEnabled", false)
 				.Fn(api.PersonAnimation));
 
-			// ---------- custom unity assets ----------
-			tools.Add(new Tool("list_cua", "List CustomUnityAsset atoms with their assetUrl, assetName, and load state.")
-				.Fn(api.ListCUA));
-			tools.Add(new Tool("cua_action", "Control CustomUnityAsset: LoadAsset, UnloadAsset, ReloadAsset, SetAssetUrl, SetAssetName.")
-				.P("uid", "string", "CUA atom uid", true)
-				.P("action", "string", "Action: LoadAsset, UnloadAsset, ReloadAsset, SetAssetUrl, SetAssetName", true)
-				.P("value", "string", "Asset URL or asset name", false)
-				.Fn(api.CUAAction));
-
+// ---------- custom unity assets ----------
+			tools.Add(new Tool("cua_action", "CUA: list, action.")
+				.P("uid", "string", "CUA uid", false)
+				.P("action", "string", "Action", true)
+				.P("name", "string", "Name", false)
+				.Fn(api.CUAActionAll));
 			// ---------- package manager ----------
 			tools.Add(new Tool("package_manager", "Local package management: ScanPackages, RefreshPackages, EnablePackage, DisablePackage, DeletePackage.")
 				.P("action", "string", "Action: ScanPackages, RefreshPackages, EnablePackage, DisablePackage, DeletePackage, ListEnabled", true)
@@ -533,45 +383,30 @@ namespace VaMMCP.Mcp {
 				.Worker()
 				.Fn(api.PerformanceProfile));
 
-			// ---------- hub / community resources ----------
-			tools.Add(new Tool("hub_browse", "Browse the VaM Hub (community content: looks, clothing, scenes, plugins...). Queries the game's own Hub API.")
-				.P("search", "string", "Search text", false)
-				.P("page", "number", "Page number (default 1)", false)
-				.P("perpage", "number", "Results per page (default 20)", false)
-				.P("sort", "string", "Sort order (e.g. resource_update_date, downloads, rating)", false)
-				.P("type", "string", "Content type filter", false)
-				.Timeout(90000).Poller()
-				.Fn(api.HubBrowse));
-			tools.Add(new Tool("hub_detail", "Get full detail of one Hub resource: package name, author, version and all downloadable .var files + dependencies. Use the package name from here with hub_download.")
-				.P("package", "string", "Package name (e.g. AcidBubbles.Timeline)", false)
-				.P("resource_id", "string", "Hub resource id from hub_browse (alternative to package)", false)
-				.Timeout(90000).Poller()
-				.Fn(api.HubDetail));
-			tools.Add(new Tool("hub_download", "Download a package from the VaM Hub using the game's own downloader (auth + install into AddonPackages). Package name from hub_browse/hub_detail results.")
-				.P("package", "string", "Package name, e.g. AcidBubbles.Timeline", true)
+// ---------- hub / community resources ----------
+			tools.Add(new Tool("hub_action", "Hub: browse, detail, download.")
+				.P("action", "string", "Action: browse, detail, download", true)
+				.P("search", "string", "Search text (browse)", false)
+				.P("package", "string", "Package name (detail/download)", false)
+				.P("resource_id", "string", "Resource id (detail)", false)
+				.P("page", "number", "Page (browse)", false)
+				.P("perpage", "number", "Per page (browse)", false)
+				.P("sort", "string", "Sort (browse)", false)
+				.P("type", "string", "Type filter (browse)", false)
 				.Timeout(300000).Poller()
-				.Fn(api.HubDownload));
-
+				.Fn(api.HubAction));
 			// ---------- skin ----------
 			tools.Add(new Tool("set_skin_sss", "Set the skin subsurface-scattering (SSS) tint of a person via the skin material's 'Subsurface Color' (_SubdermisColor).")
 				.P("person", "string", "Person uid (default: first Person)", false)
 				.P("color", "string", "#RRGGBB color (e.g. #C06060 reddish subsurface tint)", true)
 				.Fn(api.SetSkinSss));
 
-			// ---------- plugins (VaM native plugin system) ----------
-			tools.Add(new Tool("list_plugins", "List plugins on an atom's PluginManager. Empty uid = CoreControl (session plugins); pass uid=<person> for a person's plugins. A loaded plugin also registers as a storable of that atom — configure it via list_storable_params/set_param with storable=<plugin_uid>.")
-				.P("uid", "string", "Atom uid (default CoreControl = session plugins)", false)
-				.Fn(api.ListPlugins));
-			tools.Add(new Tool("add_plugin", "Add a VaM plugin (.cs/.cslist/.dll) to an atom's PluginManager and wait until it compiles/loads. Default target = CoreControl (session plugins); pass uid=<person> to attach it to a person.")
-				.P("path", "string", "Plugin path, e.g. Custom/Scripts/MyPlugin.cs or a package path", true)
-				.P("uid", "string", "Atom uid (default CoreControl = session plugins)", false)
-				.Timeout(90000).Poller()
-				.Fn(api.AddPlugin));
-			tools.Add(new Tool("remove_plugin", "Remove a plugin from an atom's PluginManager.")
-				.P("plugin_uid", "string", "Plugin uid from list_plugins", true)
-				.P("uid", "string", "Atom uid (default CoreControl = session plugins)", false)
-				.Fn(api.RemovePlugin));
-
+// ---------- plugins (VaM native plugin system) ----------
+			tools.Add(new Tool("plugin_action", "Plugins: list, add, remove.")
+				.P("action", "string", "Action: list, add, remove", true)
+				.P("path", "string", "Plugin path (for add)", false)
+				.P("uid", "string", "Plugin uid (for remove)", false)
+				.Fn(api.PluginAction));
 			// ---------- eval escape hatch ----------
 			if (allowEval) {
 				int evalTimeoutMs = Plugin.cfgEvalTimeoutSec.Value > 0 ? Plugin.cfgEvalTimeoutSec.Value * 1000 : 30000;

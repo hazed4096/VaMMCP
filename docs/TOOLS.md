@@ -29,6 +29,8 @@ VaM runtime status: plugin version, VaM version, atom/person counts, endpoint, e
 | --- | --- | --- |
 | `list_atom_types` | — | Creatable atom types, grouped by category (from VaM's runtime data) |
 | `list_atoms` | `type?` | Atoms in the scene (uid/type/on/position/rotation) |
+| `list_objects` | `type?`, `fields?`, `query?`, `limit?`, `bbox?` | Per-atom rows with a bounding box by default. `fields=placement,contents,health` adds renderer/collider/rigidbody/storable counts, subscene owner, and for persons a control-state census (`On`/`Off`/`other`), sims on/off, hip-to-chest distance, a `torn` flag, worn clothing and active hair. `query` filters by uid substring, `limit` caps rows |
+| `scene_state` | `detail?` = summary, persons, plugins, physics, diagnostics, full | `diagnostics` is the scene audit: per-person control states + sims + worn items, every plugin instance with its Person Uid/status, and a `health` block listing atoms with no renderers, non-finite (NaN/Inf) transforms, **torn persons** (hip-to-chest > 0.60 m, the classic "body stretched across the room" failure) and **overlapping persons** (shared hip position), plus a plain-language `warnings` list |
 | `add_atom` | `type`*, `uid?` | Create an atom and wait until it is ready (up to 90 s; polls by uid) |
 | `remove_atom` | `uid`* | Delete an atom |
 | `set_atom_on` | `uid`*, `on`* | Show/hide |
@@ -117,6 +119,15 @@ VaM runtime status: plugin version, VaM version, atom/person counts, endpoint, e
 | `set_camera` | `position?`, `rotation?`, `fov?` | Move the camera |
 | `aim_camera` | `uid?` / `person?` + `control?`, `position?`, `fov?` | Rotate the camera to look at a target without touching position (or move it first with `position`). Target: any atom `uid`, or `person` (+ control, default `hipControl`). Solves the hand-computed-yaw trap — Unity yaw-180 views are mirrored (screen-right = -X) |
 | `capture_view` | `width?`, `height?`, `path?`, `return_image?`, `mode?`, `timeout_ms?` | Screenshot (default `Saves/PluginData/vam-mcp/preview.png`). `mode=window` (default) grabs the real back buffer so person skin/clothing render correctly (polls until the next frame; TailSaver-style idle can make it slow). **Known limitation: on some boots the window grab returns an all-black buffer even while VaM is active — if so use `mode=camera`.** `mode=camera` does the fast RenderTexture re-render of the monitor camera; it renders the real scene (verified: camera moves + environment + Hub panels) but person meshes may come out black in it. With `return_image=true` the PNG also comes back as an MCP image block — keep the resolution modest (e.g. 640×360); anything above 4 MB stays on disk only. Note: applying skin/clothing colours is still verified best in the VaM window, captures are indicative |
+
+## Independent MCP camera
+
+| Tool | Arguments | Notes |
+| --- | --- | --- |
+| `mcp_camera_create` | `position?`, `rotation?`, `fov?` | Create (once) an independent MCP camera that never touches the editor/monitor view. Idempotent — re-calling returns the existing camera. Returns uid `mcp_camera`, name, position, rotation, fov. |
+| `mcp_camera_get` | — | Read the independent MCP camera position, rotation and FOV. |
+| `mcp_camera_set` | `position?`, `rotation?`, `fov?` | Move/aim the independent MCP camera. |
+| `mcp_camera_capture` | `width?`, `height?`, `path?`, `return_image?`, `timeout_ms?` | Screenshot from the independent MCP camera (never disturbs the editor view). Renders the camera into a RenderTexture and reads it back to PNG (default `Saves/PluginData/vam-mcp/mcp_camera.png`). With `return_image=true` the PNG also comes back inline — keep resolution modest; above 4 MB stays on disk only. |
 
 ## Simulation
 

@@ -854,15 +854,251 @@ namespace VaMMCP.Api {
 			return r;
 		}
 
+		// ---- scene visibility helpers -------------------------------------
+		// Everything below exists so an agent can *see* the scene instead of
+		// guessing: component counts, control states, sims, torn-body detection,
+		// duplicate placement, plugin status and non-finite transforms.
+
+		private static bool Finite(float v) {
+			return !float.IsNaN(v) && !float.IsInfinity(v);
+		}
+
+		private static bool Finite(Vector3 v) {
+			return Finite(v.x) && Finite(v.y) && Finite(v.z);
+		}
+
+		private static int CountComponents<T>(Atom a) where T : Component {
+			try {
+				T[] cs = a.GetComponentsInChildren<T>(true);
+				return cs == null ? 0 : cs.Length;
+			} catch { return 0; }
+		}
+
+		private static string SubSceneOf(Atom a) {
+			try {
+				Transform t = a.transform != null ? a.transform.parent : null;
+				int guard = 0;
+				while (t != null && guard++ < 32) {
+					Atom owner = null;
+					try { owner = SuperController.singleton.GetAtomByUid(t.name); } catch { }
+					if (owner != null && owner.type == "SubScene") return owner.uid;
+					t = t.parent;
+				}
+			} catch { }
+			int slash = a.uid.LastIndexOf('/');
+			return slash > 0 ? a.uid.Substring(0, slash) : "";
+		}
+
+		private static int SimsOn(Atom a, out int simsTotal) {
+			int on = 0;
+			simsTotal = 0;
+			List<string> ids = a.GetStorableIDs();
+			if (ids == null) return 0;
+			for (int i = 0; i < ids.Count; i++) {
+				string sid = ids[i];
+				if (sid == null) continue;
+				bool isSim = sid.EndsWith("Sim") || sid == "SoftBodyPhysicsEnabler";
+				if (!isSim) continue;
+				JSONStorable st = a.GetStorableByID(sid);
+				if (st == null) continue;
+				JSONStorableBool b = st.GetBoolJSONParam("simEnabled");
+				if (b == null) b = st.GetBoolJSONParam("simulationEnabled");
+				if (b == null && sid == "SoftBodyPhysicsEnabler") b = st.GetBoolJSONParam("enabled");
+				if (b == null) continue;
+				simsTotal++;
+				if (b.val) on++;
+			}
+			return on;
+		}
+
+		/// <summary>Control-state census + torn-body detection for one person.</summary>
+		private JSONClass PersonAudit(Atom p) {
+			JSONClass row = new JSONClass();
+			row["uid"] = p.uid;
+			row["on"] = JSONRaw.Bool(p.on);
+			int on = 0, off = 0, other = 0, controls = 0, nonFinite = 0;
+			Vector3 hip = Vector3.zero, chest = Vector3.zero;
+			bool haveHip = false, haveChest = false;
+			List<string> ids = p.GetStorableIDs();
+			if (ids != null) {
+				for (int i = 0; i < ids.Count; i++) {
+					string sid = ids[i];
+					if (sid == null || !sid.EndsWith("Control")) continue;
+					FreeControllerV3 fc = p.GetStorableByID(sid) as FreeControllerV3;
+					if (fc == null) continue;
+					controls++;
+					string ps = fc.currentPositionState.ToString();
+					if (ps == "On") on++;
+					else if (ps == "Off") off++;
+					else other++;
+					Vector3 wp = fc.transform.position;
+					if (!Finite(wp)) nonFinite++;
+					if (sid == "hipControl") { hip = wp; haveHip = true; }
+					else if (sid == "chestControl") { chest = wp; haveChest = true; }
+				}
+			}
+			int simsTotal = 0;
+			int simsOn = SimsOn(p, out simsTotal);
+			row["controls"] = JSONRaw.Num(controls);
+			row["states"] = new JSONClass();
+			row["states"]["On"] = JSONRaw.Num(on);
+			row["states"]["Off"] = JSONRaw.Num(off);
+			row["states"]["other"] = JSONRaw.Num(other);
+			row["simsOn"] = JSONRaw.Num(simsOn);
+			row["simsTotal"] = JSONRaw.Num(simsTotal);
+			if (haveHip) row["hip"] = Vec(hip);
+			if (haveChest) row["chest"] = Vec(chest);
+			if (haveHip && haveChest) {
+				float d = Vector3.Distance(hip, chest);
+				row["hipChest"] = F(d);
+				if (d > 0.60f) row["torn"] = JSONRaw.Bool(true);
+			}
+			if (nonFinite > 0) row["nonFiniteControls"] = JSONRaw.Num(nonFinite);
+			try {
+				DAZCharacterSelector sel = p.GetStorableByID("geometry") as DAZCharacterSelector;
+				if (sel != null) {
+					DAZClothingItem[] items = sel.clothingItems;
+					StringBuilder worn = new StringBuilder();
+					int wornCount = 0;
+					if (items != null) {
+						for (int i = 0; i < items.Length; i++) {
+							if (items[i] != null && items[i].active) {
+								wornCount++;
+								if (worn.Length < 400) { worn.Append(items[i].uid); worn.Append("; "); }
+							}
+						}
+					}
+					JSONArray wornArr = new JSONArray();
+					if (items != null) {
+						for (int i = 0; i < items.Length; i++) {
+							if (items[i] != null && items[i].active) wornArr.Add(items[i].uid);
+						}
+					}
+					row["wornCount"] = JSONRaw.Num(wornCount);
+					row["worn"] = wornArr;
+					DAZHairGroup[] hairs = sel.hairItems;
+					int hairsOn = 0;
+					if (hairs != null) for (int i = 0; i < hairs.Length; i++) if (hairs[i] != null && hairs[i].active) hairsOn++;
+					row["hairItemsOn"] = JSONRaw.Num(hairsOn);
+				}
+			} catch { }
+			row["renderers"] = JSONRaw.Num(CountComponents<Renderer>(p));
+			row["colliders"] = JSONRaw.Num(CountComponents<Collider>(p));
+			row["rigidbodies"] = JSONRaw.Num(CountComponents<Rigidbody>(p));
+			string sub = SubSceneOf(p);
+			if (sub != "") row["subScene"] = sub;
+			return row;
+		}
+
+		private JSONClass Diagnostics() {
+			JSONClass r = new JSONClass();
+			JSONClass counts = new JSONClass();
+			JSONArray persons = new JSONArray();
+			JSONArray noRenderers = new JSONArray();
+			JSONArray nonFinite = new JSONArray();
+			JSONArray torn = new JSONArray();
+			List<Atom> people = new List<Atom>();
+			int atoms = 0, hidden = 0;
+			foreach (Atom a in SC.GetAtoms()) {
+				if (a == null) continue;
+				atoms++;
+				if (!a.on) hidden++;
+				int n = counts[a.type] == null ? 0 : counts[a.type].AsInt;
+				counts[a.type] = JSONRaw.Num(n + 1);
+				if (a.type == "Person") people.Add(a);
+				if (a.type != "CoreControl" && a.type != "InvisibleLight" && a.type != "VRController" &&
+					a.type != "WindowCamera" && a.type != "PlayerNavigationPanel" && a.type != "Empty")
+					if (CountComponents<Renderer>(a) == 0) noRenderers.Add(a.uid);
+				if (!Finite(a.transform.position) || !Finite(a.transform.eulerAngles)) nonFinite.Add(a.uid);
+			}
+			for (int i = 0; i < people.Count; i++) {
+				JSONClass row = PersonAudit(people[i]);
+				persons.Add(row);
+				if (row["torn"] != null) torn.Add(people[i].uid);
+			}
+			// duplicate placement: two persons whose hips sit within 5 cm
+			JSONArray overlaps = new JSONArray();
+			for (int i = 0; i < people.Count; i++) {
+				FreeControllerV3 a1 = people[i].GetStorableByID("hipControl") as FreeControllerV3;
+				if (a1 == null) continue;
+				for (int j = i + 1; j < people.Count; j++) {
+					FreeControllerV3 b1 = people[j].GetStorableByID("hipControl") as FreeControllerV3;
+					if (b1 == null) continue;
+					if (Vector3.Distance(a1.transform.position, b1.transform.position) < 0.05f) {
+						JSONClass pair = new JSONClass();
+						pair["a"] = people[i].uid;
+						pair["b"] = people[j].uid;
+						overlaps.Add(pair);
+					}
+				}
+			}
+			JSONArray plugins = new JSONArray();
+			try {
+				Atom cc = SC.GetAtomByUid("CoreControl");
+				if (cc != null) {
+					foreach (string sid in cc.GetStorableIDs()) {
+						if (sid == null || !sid.StartsWith("plugin#")) continue;
+						JSONStorable st = cc.GetStorableByID(sid);
+						if (st == null) continue;
+						JSONClass row = new JSONClass();
+						row["storable"] = sid;
+						JSONStorableString pu = st.GetStringJSONParam("Person Uid");
+						if (pu != null) row["personUid"] = pu.val;
+						string[] statusParams = { "Status", "Arm Status", "Rig Status", "Gate Status", "Undo Status" };
+						for (int i = 0; i < statusParams.Length; i++) {
+							JSONStorableString sv = st.GetStringJSONParam(statusParams[i]);
+							if (sv != null) { row["status"] = sv.val; break; }
+						}
+						JSONStorableBool en = st.GetBoolJSONParam("enabled");
+						if (en != null) row["enabled"] = JSONRaw.Bool(en.val);
+						plugins.Add(row);
+					}
+				}
+			} catch { }
+			r["atoms"] = JSONRaw.Num(atoms);
+			r["hiddenAtoms"] = JSONRaw.Num(hidden);
+			r["byType"] = counts;
+			r["persons"] = persons;
+			r["plugins"] = plugins;
+			JSONClass health = new JSONClass();
+			health["noRenderers"] = noRenderers;
+			health["nonFiniteTransforms"] = nonFinite;
+			health["tornPersons"] = torn;
+			health["overlappingPersons"] = overlaps;
+			r["health"] = health;
+			JSONArray warnings = new JSONArray();
+			if (torn.Count > 0) warnings.Add("torn persons (hip->chest > 0.60 m): set every control at once from a known-good pose, do not move hip/feet only");
+			if (overlaps.Count > 0) warnings.Add("two persons share a hip position (duplicate/leftover clone?)");
+			if (noRenderers.Count > 0) warnings.Add("atoms with no renderers (invisible or failed asset load)");
+			if (nonFinite.Count > 0) warnings.Add("non-finite transforms (NaN/Inf) - physics blow-up");
+			for (int i = 0; i < persons.Count; i++) {
+				JSONClass pr = persons[i] as JSONClass;
+				if (pr == null) continue;
+				int sOn = pr["simsOn"] == null ? 0 : pr["simsOn"].AsInt;
+				int cOff = pr["states"] != null && pr["states"]["Off"] != null ? pr["states"]["Off"].AsInt : -1;
+				if (sOn > 0 && cOff > 0) { }
+			}
+			r["warnings"] = warnings;
+			return r;
+		}
+
 		/// <summary>List all objects (atoms) in the scene with uid, type, on/off, position, rotation,
-		/// scale and optional bounding box (min/max/center/size in world space from renderers).</summary>
+		/// scale and optional bounding box (min/max/center/size in world space from renderers).
+		/// fields=placement,contents,health adds component counts / control / sim detail,
+		/// query filters by uid substring, limit caps the rows.</summary>
 		public JSONNode ListObjects(JSONNode args) {
 			string type = S(args, "type");
-			bool doBbox = Bool(args, "bbox", true);
+			string fields = S(args, "fields");
+			string query = S(args, "query");
+			int limit = (int)Num(args, "limit", 0);
+			bool wantContent = fields.IndexOf("contents", StringComparison.OrdinalIgnoreCase) >= 0;
+			bool wantHealth = fields.IndexOf("health", StringComparison.OrdinalIgnoreCase) >= 0;
+			bool doBbox = Bool(args, "bbox", fields == "");
 			JSONArray arr = new JSONArray();
 			foreach (Atom a in SC.GetAtoms()) {
 				if (a == null) continue;
 				if (type != "" && !string.Equals(a.type, type, StringComparison.OrdinalIgnoreCase)) continue;
+				if (query != "" && a.uid.IndexOf(query, StringComparison.OrdinalIgnoreCase) < 0) continue;
 				JSONClass row = AtomInfo(a);
 				if (doBbox) {
 					Renderer[] rs = a.GetComponentsInChildren<Renderer>(true);
@@ -880,7 +1116,31 @@ namespace VaMMCP.Api {
 						row["bbox_size"] = JSONRaw.Null();
 					}
 				}
+				if (wantContent) {
+					row["renderers"] = JSONRaw.Num(CountComponents<Renderer>(a));
+					row["colliders"] = JSONRaw.Num(CountComponents<Collider>(a));
+					row["rigidbodies"] = JSONRaw.Num(CountComponents<Rigidbody>(a));
+					row["storables"] = JSONRaw.Num(a.GetStorableIDs().Count);
+					string sub = SubSceneOf(a);
+					if (sub != "") row["subScene"] = sub;
+				}
+				if (wantHealth) {
+					bool ok = Finite(a.transform.position) && Finite(a.transform.eulerAngles);
+					row["finite"] = JSONRaw.Bool(ok);
+					if (a.type == "Person") {
+						JSONClass audit = PersonAudit(a);
+						row["controls"] = audit["controls"];
+						row["states"] = audit["states"];
+						row["simsOn"] = audit["simsOn"];
+						row["simsTotal"] = audit["simsTotal"];
+						if (audit["hipChest"] != null) row["hipChest"] = audit["hipChest"];
+						if (audit["torn"] != null) row["torn"] = audit["torn"];
+						if (audit["worn"] != null) row["worn"] = audit["worn"];
+						if (audit["hairItemsOn"] != null) row["hairItemsOn"] = audit["hairItemsOn"];
+					}
+				}
 				arr.Add(row);
+				if (limit > 0 && arr.Count >= limit) break;
 			}
 			JSONClass r = new JSONClass();
 			r["count"] = JSONRaw.Num(arr.Count);
@@ -5230,6 +5490,11 @@ namespace VaMMCP.Api {
 			}
 			if (detail == "physics" || detail == "full") {
 				r["physics"] = ListPhysicsObjects(new JSONClass())["objects"];
+			}
+			if (detail == "diagnostics" || detail == "full") {
+				JSONClass diag = Diagnostics();
+				foreach (string k in new string[] { "persons", "plugins", "health", "warnings", "hiddenAtoms", "byType" })
+					if (diag[k] != null) r[k] = diag[k];
 			}
 			return r;
 		}
