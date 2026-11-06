@@ -493,13 +493,13 @@ namespace VaMMCP.Api {
 				loadAtomCount = 0;
 				loadProgressAt = 0f;
 			}
-			if (loading && loadStartedAt > 0f && (Time.realtimeSinceStartup - loadStartedAt) > 180f
-				&& (loadProgressAt == 0f || (Time.realtimeSinceStartup - loadProgressAt) > 90f)) {
+			if (loading && loadStartedAt > 0f && (Time.realtimeSinceStartup - loadStartedAt) > 600f
+				&& (loadProgressAt == 0f || (Time.realtimeSinceStartup - loadProgressAt) > 300f)) {
 				FieldInfo fi = typeof(SuperController).GetField("_isLoading", BindingFlags.NonPublic | BindingFlags.Instance);
 				if (fi != null) fi.SetValue(SC, false);
 				loadState = 0;
 				loadStartedAt = 0f;
-				Log.Warn("VaMMCP loader watchdog: load stalled (no atom progress for >90s at " + countNow + " atoms), force-cleared _isLoading");
+				Log.Warn("VaMMCP loader watchdog: load stalled (no atom progress for >300s at " + countNow + " atoms), force-cleared _isLoading");
 			}
 			Dictionary<string, Atom> dict = Priv("atoms") as Dictionary<string, Atom>;
 			List<Atom> list = Priv("atomsList") as List<Atom>;
