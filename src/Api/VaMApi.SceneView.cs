@@ -755,7 +755,8 @@ namespace VaMMCP.Api {
 				JSONClass info = new JSONClass();
 				info["uid"] = a.uid;
 				info["type"] = a.type;
-				info["root"] = TreeWalk(t, 0, maxDepth, query, components, nodeLimit, precision);
+				int budget = 400;
+				info["root"] = TreeWalk(t, 0, maxDepth, query, components, nodeLimit, precision, ref budget);
 				r["atoms"] = new JSONArray();
 				((JSONArray)r["atoms"]).Add(info);
 				r["count"] = JSONRaw.Num(1);
@@ -771,7 +772,11 @@ namespace VaMMCP.Api {
 					info["type"] = a.type;
 					if (!a.on) info["on"] = JSONRaw.Bool(false);
 					Transform t = a.mainController != null ? a.mainController.transform : a.transform;
-					info["root"] = TreeWalk(t, 0, maxDepth, query, components, nodeLimit, precision);
+					// A whole scene's trees in one call needs a hard node budget, not
+					// just a per-node child cap: 40 atoms x 50 children x 50 more adds
+					// up to thousands of lines nobody asked for.
+					int budget = ClampI(nodeLimit * (maxDepth + 1), 20, 400);
+					info["root"] = TreeWalk(t, 0, maxDepth, query, components, nodeLimit, precision, ref budget);
 					arr.Add(info);
 				}
 				r["count"] = JSONRaw.Num(arr.Count);
@@ -783,8 +788,9 @@ namespace VaMMCP.Api {
 		}
 
 		private static JSONNode TreeWalk(Transform t, int depth, int maxDepth, string query,
-										bool components, int nodeLimit, int precision) {
+										bool components, int nodeLimit, int precision, ref int budget) {
 			if (t == null) return JSONRaw.Null();
+			budget--;
 			JSONClass node = new JSONClass();
 			node["name"] = t.name;
 			if (components) {
@@ -804,10 +810,11 @@ namespace VaMMCP.Api {
 			if (kids == 0 || depth >= maxDepth) return node;
 			JSONArray children = new JSONArray();
 			for (int i = 0; i < kids && children.Count < nodeLimit; i++) {
+				if (budget <= 0) { node["truncated"] = JSONRaw.Bool(true); break; }
 				Transform c = t.GetChild(i);
 				if (c == null) continue;
 				if (query != "" && !TreeMatches(c, query, 3)) continue;
-				children.Add(TreeWalk(c, depth + 1, maxDepth, query, components, nodeLimit, precision));
+				children.Add(TreeWalk(c, depth + 1, maxDepth, query, components, nodeLimit, precision, ref budget));
 			}
 			if (children.Count > 0) node["children"] = children;
 			if (children.Count < kids) node["childrenShown"] = JSONRaw.Num(children.Count);
