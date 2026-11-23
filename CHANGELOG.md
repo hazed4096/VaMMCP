@@ -6,6 +6,47 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-23
+
+### Changed
+- **Scene inspection is now request-shaped.** `scene_state`, `list_objects`,
+  `list_atoms`, `atom_tree`, `person_state`, `physics_state`, `find_atoms` and
+  `storable_diff` all take a projection (`fields` / `detail` presets), a bound
+  (`limit` / `offset`, plus reported `total` / `returned` / `hasMore`) and a
+  filter (`query`, `type`, `param`). The point is context cost: an agent can ask
+  for `uid,pos` of six atoms instead of every field of every atom, and can tell
+  from the response whether anything was withheld.
+- **Cheap by default.** `list_objects` no longer computes bounding boxes unless
+  asked (`bbox=true` or `fields=...,bbox`) — it used to emit four coordinate
+  arrays per atom; `atom_tree` returns nested `children` arrays and drops the
+  per-node component strings unless `components=true`; `physics_state` returns
+  counts plus timing and only lists objects with `detail=objects`;
+  `person_state` caps morph/item lists (10/20 by default) but always reports the
+  true counts and the truncated remainder.
+- **`scene_state` response shape.** `atomTypes` (array of `{type, count}`) is now
+  `types` (a map), and the top-level `camera` block moved into the opt-in
+  `cameras` section. `detail=persons|plugins|physics|diagnostics` still returns
+  what it used to, now inside the matching section.
+
+### Added
+- **`scene_state uid=<uid>` — per-atom dossier.** Storables with parameter
+  counts (`f`/`b`/`c`/`s`), control ids with their position state and position,
+  sims with their on/off state, plugin instances and asset `urls`. This is the
+  "what is this atom, exactly" view that previously took several calls
+  (list_atom_storables + list_control + list_plugins) and could not show states.
+- **`scene_state sections=`.** `meta`, `types`, `persons`, `warnings` (defaults)
+  plus opt-in `atoms`, `health`, `plugins`, `physics`, `cameras`,
+  `performance`, `animation`, `controls`, or `all`. The `cameras` section lists
+  every active camera with depth/fov/position and marks VaM's monitor camera, so
+  a capture decision no longer needs a failed capture to learn the framing.
+- **Person control census in overviews.** `scene_state` person rows carry
+  `controls: [On, Off, other]`, `sims: "on/total"`, worn/hair counts, `torn`,
+  `hipChest` and any non-finite controls — the torn-body check without running
+  the whole diagnostics pass.
+- Per-person / per-atom `subScene` attribution in listings, and the scene path
+  this API last loaded (`scene_state.scene.scene`, blank when someone else
+  loaded it).
+
 ### Added
 - **`aim_camera` (new tool).** Rotates the monitor camera to look at a target
   without touching position (or moves it first via `position`). Target is any

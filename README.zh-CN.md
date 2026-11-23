@@ -23,25 +23,36 @@ MCP 客户端 ──HTTP/JSON-RPC──▶ VaMMCP (BepInEx 插件, VaM 进程内
 > ⚠️ 本项目是**非官方**社区项目，与 Meshed VR / Virt-A-Mate / VaM Hub 无任何关联。
 > 请仅在你合法拥有的 VaM 副本上使用，并遵守 VaM 的 EULA 与 Hub 内容许可。
 
-## ✨ 功能一览（64 个工具）
+## ✨ 功能一览（73 个工具）
 
 | 分类 | 工具 |
 | --- | --- |
-| 状态 | `status` |
-| 场景 | `list_scenes` `load_scene` `new_scene` `save_scene` |
-| Atom | `list_atom_types` `list_atoms` `add_atom` `remove_atom` `set_atom_on` `get_atom_transform` `set_atom_transform` |
+| 状态与会话 | `status` |
+| 场景 | `list_scenes` `load_scene` `new_scene` `atom_info` `loader_heal` `save_scene` `press_key` `ui_hud` |
+| Atom | `list_atom_types` `list_atoms` `list_objects` `add_atom` `remove_atom` `set_atom_on` `get_atom_transform` `set_atom_transform` |
 | 人物 | `add_person` `list_persons` `list_looks` `load_look` `save_look` `set_character` |
-| 预设导出 | `save_look`（外观，含服装/发型）`save_pose` `save_full_preset`（Full） |
-| 捏人 | `list_morphs` `set_morph` `get_morph` `reset_morphs` |
-| 服装/发型 | `list_packages` `list_clothing_presets`（扫描磁盘+全部 .var 包）`load_clothing_preset` `list_clothing_items` `add_clothing_item` `remove_clothing_item` `set_clothing_item_on` `list_hair_presets` `load_hair_preset` `list_hair_items` `add_hair_item` `remove_hair_item` `set_hair_item_on` |
-| 姿态/表情 | `list_poses` `load_pose` `save_pose` `list_expressions` `set_expression` |
-| 骨骼控制 | `list_controls` `get_control` `set_control` `set_gaze` |
+| 捏人 | `morph_action`（list / set / get / reset） |
+| 服装/发型 | `clothing_action` `hair_action`（预设、条目、增删/穿脱） |
+| 姿态/表情 | `pose_action`（list / load / save / savefull）`expression_action` |
+| 骨骼控制 | `list_controls` `get_control` `set_control` `set_control_state` `control_pose` `person_teleport` `person_point_at` `set_gaze` |
 | 通用参数（长尾全覆盖） | `list_atom_storables` `list_storable_params` `get_param` `set_param` `call_action` |
-| 相机 | `get_camera` `set_camera` `capture_view` |
-| 模拟 | `set_simulation` `reset_simulation` |
-| Hub 社区资源 | `hub_browse` `hub_detail` `hub_download` |
+| 相机 | `camera_action`（get / set / aim / capture，默认使用自有 MCP 相机） |
+| 模拟 | `simulation_action`（set / reset） |
+| 动画 | `animation_action`（模式、步骤、录制） |
+| 触发器 | `trigger_action` `trigger_ui` |
+| 物理 | `physics_action`（对象、关节） |
+| 灯光/音频 | `light_action` `audio_action` |
+| 用户偏好 | `get_user_preferences` `set_user_preferences` |
+| 场景浏览器/模板 | `scene_browser` `template_browser` |
+| 原子 UI | `atom_action` `atom_geometry_choices` |
+| 人物动画 | `person_animation` |
+| 自定义 Unity 资源 | `cua_action` |
+| 包管理 | `package_manager` |
+| 手部控制/材质 | `person_hand_control` `person_material` |
+| 场景状态/诊断 | `scene_state` `atom_tree` `person_state` `physics_state` `simulation_performance` `find_atoms` `storable_diff` `scene_dependencies` `performance_profile` |
+| Hub 社区资源 | `hub_action`（browse / detail / download） |
 | 皮肤 | `set_skin_sss`（次表面反射 `_SubdermisColor`） |
-| 插件管理 | `list_plugins` `add_plugin` `remove_plugin` |
+| 插件管理 | `plugin_action`（list / add / remove） |
 | 逃生舱（默认关） | `eval_cs` |
 
 完整参考：**[docs/TOOLS.zh-CN.md](docs/TOOLS.zh-CN.md)**。
@@ -137,7 +148,7 @@ src/
 │   ├── HttpServer.cs      # 最小 HTTP/1.1 server（Streamable HTTP 传输、Origin 校验、keep-alive）
 │   ├── McpServer.cs       # MCP 协议：initialize / tools/list / tools/call / resources
 │   ├── Tool.cs            # 工具定义（名称/描述/JSON Schema/处理器/超时）
-│   └── ToolRegistry.cs    # 64 个工具注册
+│   └── ToolRegistry.cs    # 73 个工具注册
 └── Api/
     └── VaMApi.cs          # VaM 控制层（全部工具实现）
 ```

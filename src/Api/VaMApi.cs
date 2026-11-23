@@ -17,7 +17,10 @@ namespace VaMMCP.Api {
 	/// The VaM control layer. Every method must be called on the Unity main thread
 	/// (wrap with MainThreadDispatcher.Run), except AddAtom-style pollers.
 	/// </summary>
-	public class VaMApi {
+	public partial class VaMApi {
+		/// <summary>Scene this API last loaded (for scene_state's meta block). VaM
+		/// exposes no public "current scene path", so this tracks only our own loads.</summary>
+		private static volatile string lastScenePath = "";
 		public readonly MainThreadDispatcher Mt;
 
 		public VaMApi(MainThreadDispatcher mt) {
@@ -310,6 +313,7 @@ namespace VaMMCP.Api {
 			} else {
 				SC.LoadMerge(path);
 			}
+			lastScenePath = merge ? (lastScenePath == "" ? path : lastScenePath + " + " + path) : path;
 			JSONClass r = new JSONClass();
 			r["path"] = path;
 			r["merge"] = JSONRaw.Bool(merge);
@@ -319,6 +323,7 @@ namespace VaMMCP.Api {
 
 		public JSONNode NewScene() {
 			SC.NewScene();
+			lastScenePath = "";
 			JSONClass r = new JSONClass();
 			r["ok"] = JSONRaw.Bool(true);
 			return r;
@@ -840,19 +845,6 @@ namespace VaMMCP.Api {
 			return r;
 		}
 
-		public JSONNode ListAtoms(JSONNode args) {
-			string type = S(args, "type");
-			JSONArray arr = new JSONArray();
-			foreach (Atom a in SC.GetAtoms()) {
-				if (a == null) continue;
-				if (type != "" && !string.Equals(a.type, type, StringComparison.OrdinalIgnoreCase)) continue;
-				arr.Add(AtomInfo(a));
-			}
-			JSONClass r = new JSONClass();
-			r["count"] = JSONRaw.Num(arr.Count);
-			r["atoms"] = arr;
-			return r;
-		}
 
 		// ---- scene visibility helpers -------------------------------------
 		// Everything below exists so an agent can *see* the scene instead of
@@ -1104,71 +1096,6 @@ namespace VaMMCP.Api {
 			return r;
 		}
 
-		/// <summary>List all objects (atoms) in the scene with uid, type, on/off, position, rotation,
-		/// scale and optional bounding box (min/max/center/size in world space from renderers).
-		/// fields=placement,contents,health adds component counts / control / sim detail,
-		/// query filters by uid substring, limit caps the rows.</summary>
-		public JSONNode ListObjects(JSONNode args) {
-			string type = S(args, "type");
-			string fields = S(args, "fields");
-			string query = S(args, "query");
-			int limit = (int)Num(args, "limit", 0);
-			bool wantContent = fields.IndexOf("contents", StringComparison.OrdinalIgnoreCase) >= 0;
-			bool wantHealth = fields.IndexOf("health", StringComparison.OrdinalIgnoreCase) >= 0;
-			bool doBbox = Bool(args, "bbox", fields == "");
-			JSONArray arr = new JSONArray();
-			foreach (Atom a in SC.GetAtoms()) {
-				if (a == null) continue;
-				if (type != "" && !string.Equals(a.type, type, StringComparison.OrdinalIgnoreCase)) continue;
-				if (query != "" && a.uid.IndexOf(query, StringComparison.OrdinalIgnoreCase) < 0) continue;
-				JSONClass row = AtomInfo(a);
-				if (doBbox) {
-					Renderer[] rs = a.GetComponentsInChildren<Renderer>(true);
-					if (rs != null && rs.Length > 0) {
-						Bounds b = rs[0].bounds;
-						for (int i = 1; i < rs.Length; i++) b.Encapsulate(rs[i].bounds);
-						row["bbox_min"] = Vec(b.min);
-						row["bbox_max"] = Vec(b.max);
-						row["bbox_center"] = Vec(b.center);
-						row["bbox_size"] = Vec(b.size);
-					} else {
-						row["bbox_min"] = JSONRaw.Null();
-						row["bbox_max"] = JSONRaw.Null();
-						row["bbox_center"] = JSONRaw.Null();
-						row["bbox_size"] = JSONRaw.Null();
-					}
-				}
-				if (wantContent) {
-					row["renderers"] = JSONRaw.Num(CountComponents<Renderer>(a));
-					row["colliders"] = JSONRaw.Num(CountComponents<Collider>(a));
-					row["rigidbodies"] = JSONRaw.Num(CountComponents<Rigidbody>(a));
-					row["storables"] = JSONRaw.Num(a.GetStorableIDs().Count);
-					string sub = SubSceneOf(a);
-					if (sub != "") row["subScene"] = sub;
-				}
-				if (wantHealth) {
-					bool ok = Finite(a.transform.position) && Finite(a.transform.eulerAngles);
-					row["finite"] = JSONRaw.Bool(ok);
-					if (a.type == "Person") {
-						JSONClass audit = PersonAudit(a);
-						row["controls"] = audit["controls"];
-						row["states"] = audit["states"];
-						row["simsOn"] = audit["simsOn"];
-						row["simsTotal"] = audit["simsTotal"];
-						if (audit["hipChest"] != null) row["hipChest"] = audit["hipChest"];
-						if (audit["torn"] != null) row["torn"] = audit["torn"];
-						if (audit["worn"] != null) row["worn"] = audit["worn"];
-						if (audit["hairItemsOn"] != null) row["hairItemsOn"] = audit["hairItemsOn"];
-					}
-				}
-				arr.Add(row);
-				if (limit > 0 && arr.Count >= limit) break;
-			}
-			JSONClass r = new JSONClass();
-			r["count"] = JSONRaw.Num(arr.Count);
-			r["objects"] = arr;
-			return r;
-		}
 
 		/// <summary>Poller tool: starts AddAtomByType on the main thread, then polls for the new atom.</summary>
 		public JSONNode AddAtom(JSONNode args) {
@@ -3308,14 +3235,156 @@ namespace VaMMCP.Api {
 
 		private static volatile PreviewGrabber grabber;
 
+		/// <summary>
+		/// Capture the real presented frame with ScreenCapture. VaM does not render
+		/// the desktop view through the normal camera callbacks (OnPostRender never
+		/// fires on MonitorRig, and a manual cam.Render() into a RenderTexture drops
+		/// the DAZCharacter meshes), so this is the only path that includes person
+		/// skin/clothing. It needs the window to be visible but NOT focused.
+		/// </summary>
+		private byte[] CaptureScreenPng(int timeoutMs, out string error) {
+			error = null;
+			string abs;
+			try {
+				string root = System.IO.Path.GetFullPath(System.IO.Path.Combine(Application.dataPath, ".."));
+				abs = System.IO.Path.Combine(root, "Saves/PluginData/vam-mcp/_screen_tmp.png");
+				string dir = System.IO.Path.GetDirectoryName(abs);
+				if (!System.IO.Directory.Exists(dir)) System.IO.Directory.CreateDirectory(dir);
+				if (System.IO.File.Exists(abs)) System.IO.File.Delete(abs);
+			} catch (Exception e) {
+				error = "screen capture path: " + e.Message;
+				return null;
+			}
+			string absPath = abs;
+			Mt.Run(delegate { ScreenCapture.CaptureScreenshot(absPath); }, 30000);
+			long deadline = Environment.TickCount + timeoutMs;
+			try {
+				while (Environment.TickCount < deadline) {
+					Thread.Sleep(100);
+					try {
+						if (System.IO.File.Exists(absPath)) {
+							byte[] b = System.IO.File.ReadAllBytes(absPath);
+							if (b != null && b.Length > 1000) return b;
+						}
+					} catch { }
+				}
+			} finally {
+				// never leave the scratch grab behind in Saves/PluginData
+				try { if (System.IO.File.Exists(absPath)) System.IO.File.Delete(absPath); } catch { }
+			}
+			error = "screen capture wrote no file within " + timeoutMs + " ms - the VaM window must be visible (not minimised) for a screen grab; use mode=\"mcp\" or mode=\"editor\" instead, they render without the window";
+			return null;
+		}
+
 		/// <summary>Attach the back-buffer grabber to the monitor camera, once.</summary>
 		private static PreviewGrabber Grabber() {
 			if (grabber != null) return grabber;
-			GameObject go = MonitorCamera().gameObject;
-			PreviewGrabber existing = go.GetComponent<PreviewGrabber>();
-			if (existing != null) { grabber = existing; return grabber; }
-			grabber = go.AddComponent<PreviewGrabber>();
+			grabber = GrabberFor(MonitorCamera());
 			return grabber;
+		}
+
+		/// <summary>Get (or attach) a PreviewGrabber on the given camera.</summary>
+		private static PreviewGrabber GrabberFor(Camera cam) {
+			if (cam == null) throw new ApiError("no camera available");
+			PreviewGrabber existing = cam.gameObject.GetComponent<PreviewGrabber>();
+			if (existing != null) return existing;
+			return cam.gameObject.AddComponent<PreviewGrabber>();
+		}
+
+		/// <summary>
+		/// Render a camera into a RenderTexture <b>as part of the normal frame
+		/// loop</b> and read it back. This is the fix for captures that came out as
+		/// black silhouettes: VaM submits the DAZCharacter (skin/clothing) meshes
+		/// per frame, and a manual <c>cam.Render()</c> outside that loop drops them.
+		/// Attaching the RT as the camera's targetTexture lets VaM's own render run
+		/// (it still happens while VaM is unfocused - runInBackground is on), and the
+		/// grab happens in OnPostRender. Nothing here needs the window in front.
+		/// </summary>
+		private byte[] CaptureViaFrame(Camera cam, int w, int h, string path, int timeoutMs, out string error) {
+			error = null;
+			if (cam == null) {
+				error = "no camera to render";
+				return null;
+			}
+			long startSeq = 0;
+			RenderTexture rt = null;
+			bool wasEnabled = true;
+			PreviewGrabber g = null;
+			try {
+				g = Mt.Run(delegate {
+					PreviewGrabber gg = GrabberFor(cam);
+					rt = new RenderTexture(w, h, 24);
+					rt.Create();
+					wasEnabled = cam.enabled;
+					gg.rtTarget = rt;
+					gg.reqWidth = w;
+					gg.reqHeight = h;
+					gg.reqPath = path;
+					gg.lastBytes = null;
+					gg.lastError = null;
+					gg.rtMode = true;
+					startSeq = Interlocked.Read(ref gg.lastSeq);
+					gg.pending = true;
+					cam.targetTexture = rt;   // next normal-loop render goes into the RT
+					cam.enabled = true;
+					return gg;
+				}, 30000);
+			} catch (Exception e) {
+				error = "could not arm the frame capture: " + e.Message;
+			}
+			bool done = false;
+			if (g != null) {
+				long deadline = Environment.TickCount + timeoutMs;
+				while (Environment.TickCount < deadline) {
+					Thread.Sleep(50);
+					if (Interlocked.Read(ref g.lastSeq) != startSeq) { done = true; break; }
+					if (g.lastError != null) break;
+				}
+				if (g.lastError != null) error = g.lastError;
+			}
+			byte[] bytes = done && error == null ? g.lastBytes : null;
+			// Restore everything the capture changed, on success and on failure:
+			// the camera keeps its own targetTexture/enabled state and the temporary
+			// RenderTexture is released, so a capture never leaves the view altered.
+			if (g != null) {
+				try {
+					Mt.Run(delegate {
+						g.rtMode = false;
+						g.rtTarget = null;
+						g.pending = false;
+						if (cam != null) {
+							cam.targetTexture = null;
+							cam.enabled = wasEnabled;
+						}
+						if (rt != null) { rt.Release(); UnityEngine.Object.Destroy(rt); }
+					}, 30000);
+				} catch (Exception e) {
+					Log.Warn("VaMMCP: capture state restore failed: " + e.Message);
+				}
+			}
+			if (bytes == null && error == null)
+				error = "the camera rendered no frame within " + timeoutMs + " ms (sim paused, or IdleSaver holding the loop at 1 fps)";
+			return bytes;
+		}
+
+		/// <summary>Build a capture response: path, size and byte count, plus the PNG
+		/// inlined as base64 when the caller asked for an image and it fits.</summary>
+		private JSONClass CaptureResult(string mode, string via, string path, int w, int h, byte[] bytes, bool returnImage) {
+			JSONClass r = new JSONClass();
+			r["mode"] = mode;
+			r["via"] = via;
+			r["path"] = path;
+			r["width"] = JSONRaw.Num(w);
+			r["height"] = JSONRaw.Num(h);
+			r["bytes"] = JSONRaw.Num(bytes != null ? bytes.Length : 0);
+			if (returnImage && bytes != null && bytes.Length <= MaxInlineImageBytes) {
+				// McpServer turns these two into an MCP image content block.
+				r["image_base64"] = Convert.ToBase64String(bytes);
+				r["image_mime"] = "image/png";
+			} else if (returnImage && bytes != null) {
+				r["note"] = "image too large to inline (" + bytes.Length + " bytes); read it from path instead";
+			}
+			return r;
 		}
 
 		/// <summary>
@@ -3346,9 +3415,12 @@ namespace VaMMCP.Api {
 			string path = S(args, "path");
 			if (path == "") path = "Saves/PluginData/vam-mcp/preview.png";
 			int timeoutMs = (int)Num(args, "timeout_ms", 20000);
+			FileManagerSecure.CreateDirectory("Saves/PluginData/vam-mcp");
 
-			// Schedule the grab on the main thread, then poll PreviewGrabber fields
-			// from this HTTP thread (both sides use volatile/Interlocked accessors).
+			// 1) back-buffer grab at the end of the monitor camera's frame: keeps the
+			//    DAZ person meshes and honours width/height. Schedule it on the main
+			//    thread, then poll PreviewGrabber fields from this HTTP thread (both
+			//    sides use volatile/Interlocked accessors).
 			long startSeq = 0;
 			bool done = false;
 			PreviewGrabber g = Mt.Run(delegate {
@@ -3363,11 +3435,6 @@ namespace VaMMCP.Api {
 				return gg;
 			});
 
-			JSONClass r = new JSONClass();
-			r["mode"] = "window";
-			r["path"] = path;
-			r["width"] = JSONRaw.Num(w);
-			r["height"] = JSONRaw.Num(h);
 			long deadline = Environment.TickCount + timeoutMs;
 			while (Environment.TickCount < deadline) {
 				Thread.Sleep(50);
@@ -3376,24 +3443,40 @@ namespace VaMMCP.Api {
 			}
 			string err = g.lastError;
 			if (done && err == null) {
-				r["pending"] = JSONRaw.Bool(false);
-				byte[] lastBytes = g.lastBytes;
-				int pngBytes = lastBytes != null ? lastBytes.Length : 0;
-				r["bytes"] = JSONRaw.Num(pngBytes);
-				r["actual_width"] = JSONRaw.Num(g.lastWidth);
-				r["actual_height"] = JSONRaw.Num(g.lastHeight);
-				if (returnImage && lastBytes != null && lastBytes.Length <= MaxInlineImageBytes) {
-					r["image_base64"] = Convert.ToBase64String(lastBytes);
-					r["image_mime"] = "image/png";
-				} else if (returnImage && lastBytes != null) {
-					r["note"] = "image too large to inline (" + pngBytes + " bytes); read it from path instead";
-				}
-			} else {
-				r["pending"] = JSONRaw.Bool(true);
-				if (err != null) r["note"] = "grab error (file path may still be from an older capture): " + err;
-				else r["note"] = "no frame rendered within " + timeoutMs + " ms (is VaM minimized, or IdleEaver holding the sim at 1 fps?) - read the file after a delay instead";
+				JSONClass ok = CaptureResult("window", "backbuffer", path, g.lastWidth, g.lastHeight, g.lastBytes, returnImage);
+				ok["pending"] = JSONRaw.Bool(false);
+				return ok;
 			}
-			return r;
+
+			// 2) The monitor rig did not raise OnPostRender (VaM's MonitorRig often
+			//    reports through a different path). Fall back to a real screen grab so
+			//    a window-mode capture still returns the presented frame.
+			string screenError = null;
+			byte[] screenBytes = CaptureScreenPng(Math.Min(timeoutMs, 15000), out screenError);
+			if (screenBytes != null) {
+				FileManagerSecure.WriteAllBytes(path, screenBytes);
+				JSONClass r = CaptureResult("window", "screen", path, Screen.width, Screen.height, screenBytes, returnImage);
+				r["pending"] = JSONRaw.Bool(false);
+				r["note"] = "back-buffer grab unavailable (" + (err ?? "no frame within " + timeoutMs + " ms") +
+					"); captured the presented screen instead, so width/height are the window size";
+				return r;
+			}
+
+			// 3) Nothing arrived. VaM may simply be idling at 1 fps - the file already
+			//    on disk is the previous capture, so say so instead of faking success.
+			if (FileManagerSecure.FileExists(path)) {
+				JSONClass pending = new JSONClass();
+				pending["mode"] = "window";
+				pending["via"] = "none";
+				pending["path"] = path;
+				pending["pending"] = JSONRaw.Bool(true);
+				pending["note"] = "no frame yet (back buffer: " + (err ?? "timeout") + "; screen: " + (screenError ?? "no file") +
+					") - the file at path may be an OLDER capture; retry, or use mode=\"mcp\" which renders on demand";
+				return pending;
+			}
+			throw new ApiError("window capture failed: back buffer: " + (err ?? "no frame within " + timeoutMs + " ms") +
+				"; screen grab: " + (screenError ?? "no file") +
+				"; use mode=\"mcp\" (own camera, renders without a visible window)");
 		}
 
 		public JSONNode CaptureViewCamera(JSONNode args) {
@@ -3404,55 +3487,36 @@ namespace VaMMCP.Api {
 			bool returnImage = Bool(args, "return_image", false);
 			string path = S(args, "path");
 			if (path == "") path = "Saves/PluginData/vam-mcp/preview.png";
+			int timeoutMs = (int)Num(args, "timeout_ms", 20000);
 			FileManagerSecure.CreateDirectory("Saves/PluginData/vam-mcp");
 
-			// All camera/RenderTexture work must run on the main thread - creating a
-			// RenderTexture from the HTTP worker thread crashes Unity natively.
-			byte[] bytes = null;
-			string captureError = null;
-			Mt.Run(delegate {
-				Camera cam = MonitorCamera();
-				if (cam == null) { captureError = "no monitor camera found"; return; }
-				RenderTexture rt = new RenderTexture(w, h, 24);
-				RenderTexture oldTarget = cam.targetTexture;
-				RenderTexture oldActive = RenderTexture.active;
-				Texture2D tex = null;
-				try {
-					cam.targetTexture = rt;
-					cam.Render();
-					RenderTexture.active = rt;
-					tex = new Texture2D(w, h, TextureFormat.RGB24, false);
-					tex.ReadPixels(new Rect(0, 0, w, h), 0, 0);
-					tex.Apply();
-					bytes = tex.EncodeToPNG();
-				} catch (Exception e) {
-					captureError = e.Message;
-				} finally {
-					cam.targetTexture = oldTarget;
-					RenderTexture.active = oldActive;
-					if (tex != null) UnityEngine.Object.Destroy(tex);
-					rt.Release();
-				}
-			}, 30000);
-			if (bytes == null) throw new ApiError(captureError != null ? captureError : "camera capture produced no frame");
-			int pngBytes = bytes.Length;
-			FileManagerSecure.WriteAllBytes(path, bytes);
-			string base64 = null;
-			if (returnImage && bytes.Length <= MaxInlineImageBytes) base64 = Convert.ToBase64String(bytes);
-			JSONClass r = new JSONClass();
-			r["mode"] = "camera";
-			r["path"] = path;
-			r["width"] = JSONRaw.Num(w);
-			r["height"] = JSONRaw.Num(h);
-			r["bytes"] = JSONRaw.Num(pngBytes);
-			if (base64 != null) {
-				// McpServer turns these two into an MCP image content block.
-				r["image_base64"] = base64;
-				r["image_mime"] = "image/png";
-			} else if (returnImage) {
-				r["note"] = "image too large to inline (" + pngBytes + " bytes); read it from path instead";
+			// 1) Render the monitor camera into a RenderTexture through the normal
+			//    frame loop (CaptureViaFrame): the requested size is honoured, the DAZ
+			//    person meshes are in the frame, and no window needs to be visible.
+			Camera cam = null;
+			string renderError = null;
+			try {
+				cam = MonitorCamera();
+			} catch (Exception e) {
+				renderError = e.Message;
 			}
-			return r;
+			byte[] bytes = cam != null
+				? CaptureViaFrame(cam, w, h, path, Math.Min(timeoutMs, 5000), out renderError)
+				: null;
+			if (bytes != null) return CaptureResult("camera", "monitor-render", path, w, h, bytes, returnImage);
+
+			// 2) Screen grab of the presented frame, HUD included.
+			string screenError = null;
+			byte[] screen = CaptureScreenPng(Math.Min(timeoutMs, 15000), out screenError);
+			if (screen != null) {
+				FileManagerSecure.WriteAllBytes(path, screen);
+				JSONClass r = CaptureResult("camera", "screen", path, Screen.width, Screen.height, screen, returnImage);
+				r["note"] = "monitor-camera render unavailable (" + (renderError ?? "no frame") +
+					"); captured the presented screen instead, so width/height are the window size";
+				return r;
+			}
+			throw new ApiError("editor capture failed: monitor render: " + (renderError ?? "no frame") +
+				"; screen grab: " + (screenError ?? "no file") + "; use mode=\"mcp\" instead");
 		}
 
 		// ===================== independent MCP camera =====================
@@ -3540,6 +3604,9 @@ namespace VaMMCP.Api {
 
 			byte[] bytes = null;
 			string captureError = null;
+			// Frame the independent camera first, then render it through the normal
+			// frame loop (see CaptureViaFrame: a manual cam.Render() loses the DAZ
+			// person meshes, which is why captures used to be black silhouettes).
 			Mt.Run(delegate {
 				Camera cam = McPCamera();
 				if (cam == null) { captureError = "could not create MCP camera"; return; }
@@ -3554,49 +3621,24 @@ namespace VaMMCP.Api {
 					Vector3 target = ResolveTargetPoint(args);
 					cam.transform.rotation = Quaternion.LookRotation(target - cam.transform.position, Vector3.up);
 				}
-				// Enable briefly so Render() definitely works, then restore.
-				bool wasEnabled = cam.enabled;
-				cam.enabled = true;
-				RenderTexture rt = new RenderTexture(w, h, 24);
-				RenderTexture oldTarget = cam.targetTexture;
-				RenderTexture oldActive = RenderTexture.active;
-				Texture2D tex = null;
-				try {
-					cam.targetTexture = rt;
-					cam.Render();
-					RenderTexture.active = rt;
-					tex = new Texture2D(w, h, TextureFormat.RGB24, false);
-					tex.ReadPixels(new Rect(0, 0, w, h), 0, 0);
-					tex.Apply();
-					bytes = tex.EncodeToPNG();
-				} catch (Exception e) {
-					captureError = e.Message;
-				} finally {
-					cam.targetTexture = oldTarget;
-					cam.enabled = wasEnabled;
-					RenderTexture.active = oldActive;
-					if (tex != null) UnityEngine.Object.Destroy(tex);
-					rt.Release();
-				}
 			}, 30000);
-			if (bytes == null) throw new ApiError(captureError != null ? captureError : "MCP camera capture produced no frame");
-			int pngBytes = bytes.Length;
-			FileManagerSecure.WriteAllBytes(path, bytes);
-			string base64 = null;
-			if (returnImage && bytes.Length <= MaxInlineImageBytes) base64 = Convert.ToBase64String(bytes);
-			JSONClass r = new JSONClass();
-			r["mode"] = "mcp_camera";
-			r["path"] = path;
-			r["width"] = JSONRaw.Num(w);
-			r["height"] = JSONRaw.Num(h);
-			r["bytes"] = JSONRaw.Num(pngBytes);
-			if (base64 != null) {
-				r["image_base64"] = base64;
-				r["image_mime"] = "image/png";
-			} else if (returnImage) {
-				r["note"] = "image too large to inline (" + pngBytes + " bytes); read it from path instead";
+			bytes = CaptureViaFrame(McPCamera(), w, h, path, timeoutMs, out captureError);
+			if (bytes != null) return CaptureResult("mcp_camera", "mcp-render", path, w, h, bytes, returnImage);
+
+			// Fallback: the MCP camera rendered nothing (recreated after a scene load,
+			// or the frame loop is stalled). Grab the presented frame so the call still
+			// returns an image, and say which path produced it.
+			string screenError = null;
+			byte[] screen = CaptureScreenPng(Math.Min(timeoutMs, 15000), out screenError);
+			if (screen != null) {
+				FileManagerSecure.WriteAllBytes(path, screen);
+				JSONClass r = CaptureResult("mcp_camera", "screen", path, Screen.width, Screen.height, screen, returnImage);
+				r["note"] = "MCP camera render unavailable (" + (captureError ?? "no frame") +
+					"); captured the presented screen instead, so the requested framing was not applied";
+				return r;
 			}
-			return r;
+			throw new ApiError("MCP camera capture failed: render: " + (captureError ?? "no frame") +
+				"; screen grab: " + (screenError ?? "no file") + "; retry, or use mode=\"editor\"");
 		}
 
 		// ===================== simulation =====================
@@ -5468,164 +5510,10 @@ namespace VaMMCP.Api {
 
 		// ===================== scene state inspection / debugging =====================
 
-		public JSONNode SceneState(JSONNode args) {
-			string detail = S(args, "detail").ToLowerInvariant();
-			if (detail == "") detail = "summary";
-			Dictionary<string, int> byType = new Dictionary<string, int>();
-			JSONClass r = new JSONClass();
-			r["plugin"] = "VaMMCP";
-			r["time"] = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
-			foreach (Atom a in SC.GetAtoms()) {
-				if (a == null) continue;
-				if (!byType.ContainsKey(a.type)) byType[a.type] = 0;
-				byType[a.type]++;
-			}
-			JSONArray types = new JSONArray();
-			int atoms = 0;
-			foreach (KeyValuePair<string, int> kv in byType) {
-				JSONClass row = new JSONClass();
-				row["type"] = kv.Key;
-				row["count"] = JSONRaw.Num(kv.Value);
-				types.Add(row);
-				atoms += kv.Value;
-			}
-			r["atoms"] = JSONRaw.Num(atoms);
-			r["atomTypes"] = types;
-			r["timeScale"] = F(Time.timeScale);
-			try { r["loadingScene"] = JSONRaw.Bool(SC.isLoading); } catch { }
-			try {
-				Camera cam = SC.MonitorCenterCamera;
-				if (cam != null) {
-					r["camera"] = new JSONClass();
-					r["camera"]["position"] = Vec(cam.transform.position);
-					r["camera"]["rotation"] = Vec(cam.transform.eulerAngles);
-				}
-			} catch { }
-			if (detail == "persons" || detail == "full") {
-				JSONNode summary = ListPersons();
-				r["persons"] = summary["persons"];
-			}
-			if (detail == "plugins" || detail == "full") {
-				JSONNode plugins = ListPlugins(new JSONClass());
-				r["plugins"] = plugins["plugins"];
-				r["pluginCount"] = plugins["count"];
-			}
-			if (detail == "physics" || detail == "full") {
-				r["physics"] = ListPhysicsObjects(new JSONClass())["objects"];
-			}
-			if (detail == "diagnostics" || detail == "full") {
-				JSONClass diag = Diagnostics();
-				foreach (string k in new string[] { "persons", "plugins", "health", "warnings", "hiddenAtoms", "byType" })
-					if (diag[k] != null) r[k] = diag[k];
-			}
-			return r;
-		}
 
-		private static void AtomTreeWalk(Transform t, int depth, int maxDepth, JSONArray outArr, int cap) {
-			if (outArr.Count >= cap) return;
-			JSONClass node = new JSONClass();
-			node["name"] = t.name;
-			StringBuilder comps = new StringBuilder();
-			Component[] cs = t.GetComponents<Component>();
-			if (cs != null) {
-				for (int i = 0; i < cs.Length; i++) {
-					if (cs[i] == null) { comps.Append("(missing);"); continue; }
-					comps.Append(cs[i].GetType().Name);
-					comps.Append(";");
-				}
-			}
-			node["components"] = comps.ToString();
-			node["depth"] = JSONRaw.Num(depth);
-			if (t.parent != null) node["parent"] = t.parent.name;
-			outArr.Add(node);
-			if (depth >= maxDepth) return;
-			foreach (Transform c in t) AtomTreeWalk(c, depth + 1, maxDepth, outArr, cap);
-		}
 
-		public JSONNode AtomTree(JSONNode args) {
-			string rootUid = S(args, "root_uid");
-			int maxDepth = (int)Num(args, "max_depth", 2);
-			if (maxDepth < 1) maxDepth = 1;
-			if (maxDepth > 5) maxDepth = 5;
-			JSONArray arr = new JSONArray();
-			if (rootUid != "") {
-				Atom a = FindAtom(rootUid);
-				JSONClass info = AtomInfo(a);
-				JSONArray nodes = new JSONArray();
-				AtomTreeWalk(a.mainController != null ? a.mainController.transform : a.transform, 0, maxDepth, nodes, 400);
-				info["nodes"] = nodes;
-				info["nodeLimit"] = JSONRaw.Num(400);
-				JSONArray single = new JSONArray();
-				single.Add(info);
-				arr = single;
-			} else {
-				foreach (Atom a in SC.GetAtoms()) {
-					if (a == null) continue;
-					JSONClass info = AtomInfo(a);
-					JSONArray nodes = new JSONArray();
-					AtomTreeWalk(a.mainController != null ? a.mainController.transform : a.transform, 0, 1, nodes, 12);
-					info["nodes"] = nodes;
-					arr.Add(info);
-					if (arr.Count >= 60) break;
-				}
-			}
-			JSONClass r = new JSONClass();
-			r["count"] = JSONRaw.Num(arr.Count);
-			r["atoms"] = arr;
-			return r;
-		}
 
-		public JSONNode PersonState(JSONNode args) {
-			Atom p = RequirePerson(S(args, "person"));
-			bool includeHidden = Bool(args, "include_hidden", false);
-			JSONClass r = new JSONClass();
-			r["uid"] = p.uid;
-			try {
-				DAZCharacterSelector sel = Selector(p);
-				try { r["character"] = sel.GetStringChooserParamValue("characterSelection"); } catch { r["character"] = ""; }
-				r["gender"] = sel.gender.ToString();
-				int morphs = 0;
-				JSONArray top = new JSONArray();
-				foreach (DAZMorph m in AllMorphs(sel)) {
-					try {
-						float v = m.morphValue;
-						if (Math.Abs(v) < 0.0005f) {
-							if (includeHidden) { morphs++; }
-							continue;
-						}
-						morphs++;
-						if (top.Count < 40) {
-							JSONClass row = new JSONClass();
-							row["name"] = m.displayName;
-							row["value"] = F(v);
-							top.Add(row);
-						}
-					} catch { }
-				}
-				r["nonZeroMorphs"] = JSONRaw.Num(morphs);
-				r["topMorphs"] = top;
-			} catch (Exception e) { r["morphs.error"] = e.Message; }
-			JSONNode cloth = ListClothingItems(args);
-			r["clothingCount"] = cloth["count"];
-			JSONNode hair = ListHairItems(args);
-			r["hairCount"] = hair["count"];
-			JSONClass controls = new JSONClass();
-			foreach (string id in p.GetStorableIDs()) {
-				if (id.EndsWith("Control", StringComparison.OrdinalIgnoreCase)) controls[id] = JSONRaw.Bool(true);
-			}
-			r["controls"] = controls;
-			return r;
-		}
 
-		public JSONNode PhysicsState() {
-			JSONClass r = new JSONClass();
-			r["timeScale"] = F(Time.timeScale);
-			r["fixedDeltaTime"] = F(Time.fixedDeltaTime);
-			JSONNode objs = ListPhysicsObjects(new JSONClass());
-			r["physicsObjectCount"] = objs["count"];
-			r["objects"] = objs["objects"];
-			return r;
-		}
 
 		public JSONNode SimulationPerformance() {
 			JSONClass r = new JSONClass();
@@ -5660,70 +5548,6 @@ namespace VaMMCP.Api {
 			return false;
 		}
 
-		public JSONNode FindAtoms(JSONNode args) {
-			string nameF = S(args, "name");
-			string typeF = S(args, "type");
-			string compF = S(args, "component");
-			string propF = S(args, "property");
-			string valF = S(args, "value");
-			string tagF = S(args, "tag");
-			if (tagF != "") throw new ApiError("tag filter is not supported by VaM's runtime; use name/type/component/property filters");
-			JSONArray arr = new JSONArray();
-			foreach (Atom a in SC.GetAtoms()) {
-				if (a == null) continue;
-				if (nameF != "" && a.uid.IndexOf(nameF, StringComparison.OrdinalIgnoreCase) < 0
-					&& (a.name == null || a.name.IndexOf(nameF, StringComparison.OrdinalIgnoreCase) < 0)) continue;
-				if (typeF != "" && !string.Equals(a.type, typeF, StringComparison.OrdinalIgnoreCase)) continue;
-				bool keep = nameF != "" || typeF != "";
-				if (compF != "") {
-					if (a.mainController == null) continue;
-					Component[] cs = a.mainController.GetComponentsInChildren<Component>(true);
-					bool found = false;
-					foreach (Component c in cs) {
-						if (c != null && c.GetType().Name.IndexOf(compF, StringComparison.OrdinalIgnoreCase) >= 0) { found = true; break; }
-					}
-					if (!found) continue;
-					keep = true;
-				}
-				if (propF != "") {
-					bool matched = false;
-					foreach (string sid in a.GetStorableIDs()) {
-						if (matched) break;
-						JSONStorable st = a.GetStorableByID(sid);
-						if (st == null) continue;
-						foreach (string n in st.GetFloatParamNames()) {
-							if ((n.IndexOf(propF, StringComparison.OrdinalIgnoreCase) >= 0 || string.Equals(n, propF, StringComparison.OrdinalIgnoreCase))
-								&& (valF == "" || ParamValueMatches(st, n, "float", valF))) { matched = true; break; }
-						}
-						if (matched) break;
-						foreach (string n in st.GetBoolParamNames()) {
-							if ((n.IndexOf(propF, StringComparison.OrdinalIgnoreCase) >= 0 || string.Equals(n, propF, StringComparison.OrdinalIgnoreCase))
-								&& (valF == "" || ParamValueMatches(st, n, "bool", valF))) { matched = true; break; }
-						}
-						if (matched) break;
-						foreach (string n in st.GetStringChooserParamNames()) {
-							if ((n.IndexOf(propF, StringComparison.OrdinalIgnoreCase) >= 0 || string.Equals(n, propF, StringComparison.OrdinalIgnoreCase))
-								&& (valF == "" || ParamValueMatches(st, n, "chooser", valF))) { matched = true; break; }
-						}
-						if (matched) break;
-						foreach (string n in st.GetStringParamNames()) {
-							if ((n.IndexOf(propF, StringComparison.OrdinalIgnoreCase) >= 0 || string.Equals(n, propF, StringComparison.OrdinalIgnoreCase))
-								&& (valF == "" || ParamValueMatches(st, n, "string", valF))) { matched = true; break; }
-						}
-					}
-					if (!matched) continue;
-					keep = true;
-				}
-				if (!keep) continue;
-				arr.Add(AtomInfo(a));
-				if (arr.Count >= 100) break;
-			}
-			JSONClass r = new JSONClass();
-			r["count"] = JSONRaw.Num(arr.Count);
-			r["matches"] = arr;
-			if (arr.Count >= 100) r["note"] = "result truncated at 100 atoms";
-			return r;
-		}
 
 		private static void CollectParamMap(JSONStorable st, Dictionary<string, float> floats, Dictionary<string, bool> bools, Dictionary<string, string> values, int cap) {
 			int i = 0;
@@ -5801,12 +5625,28 @@ namespace VaMMCP.Api {
 			foreach (string k in fb.Keys) if (!fa.ContainsKey(k)) onlyB.Add(k);
 			foreach (string k in bb.Keys) if (!ba.ContainsKey(k)) onlyB.Add(k);
 			foreach (string k in vb.Keys) if (!va.ContainsKey(k) && !fb.ContainsKey(k)) onlyB.Add(k);
+			// Optional narrowing: `param` keeps only names that match, `limit` caps
+			// the rows. Both exist so a big storable pair does not flood the caller.
+			string paramF = S(args, "param");
+			int diffLimit = ClampI((int)Num(args, "limit", 100f), 1, 2000);
+			int dropped = 0;
+			if (paramF != "" || diffs.Count > diffLimit) {
+				JSONArray kept = new JSONArray();
+				for (int i = 0; i < diffs.Count; i++) {
+					JSONNode p = diffs[i]["param"];
+					if (paramF != "" && (p == null || p.Value.IndexOf(paramF, StringComparison.OrdinalIgnoreCase) < 0)) continue;
+					if (kept.Count >= diffLimit) { dropped++; continue; }
+					kept.Add(diffs[i]);
+				}
+				diffs = kept;
+			}
 			JSONClass r = new JSONClass();
 			r["same"] = JSONRaw.Num(same);
 			r["different"] = JSONRaw.Num(diff);
 			r["onlyInA"] = onlyA;
 			r["onlyInB"] = onlyB;
 			r["diffs"] = diffs;
+			if (dropped > 0) r["truncated"] = JSONRaw.Num(dropped);
 			return r;
 		}
 

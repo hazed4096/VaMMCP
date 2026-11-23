@@ -27,25 +27,36 @@ MCP client ──HTTP/JSON-RPC──▶ VaMMCP (BepInEx plugin, inside the VaM p
 > Meshed VR, Virt-A-Mate or the VaM Hub. Use it only with a copy of VaM you legally own, and
 > respect the VaM EULA and the licence of any Hub content you download.
 
-## ✨ Tools at a glance (64)
+## ✨ Tools at a glance (73)
 
 | Category | Tools |
 | --- | --- |
-| Status | `status` |
-| Scene | `list_scenes` `load_scene` `new_scene` `save_scene` |
-| Atom | `list_atom_types` `list_atoms` `add_atom` `remove_atom` `set_atom_on` `get_atom_transform` `set_atom_transform` |
+| Status / session | `status` |
+| Scene | `list_scenes` `load_scene` `new_scene` `atom_info` `loader_heal` `save_scene` `press_key` `ui_hud` |
+| Atom | `list_atom_types` `list_atoms` `list_objects` `add_atom` `remove_atom` `set_atom_on` `get_atom_transform` `set_atom_transform` |
 | Person | `add_person` `list_persons` `list_looks` `load_look` `save_look` `set_character` |
-| Preset export | `save_look` (appearance incl. clothing/hair) `save_pose` `save_full_preset` |
-| Morphs | `list_morphs` `set_morph` `get_morph` `reset_morphs` |
-| Clothing / hair | `list_packages` `list_clothing_presets` (scans disk + every .var package) `load_clothing_preset` `list_clothing_items` `add_clothing_item` `remove_clothing_item` `set_clothing_item_on` `list_hair_presets` `load_hair_preset` `list_hair_items` `add_hair_item` `remove_hair_item` `set_hair_item_on` |
-| Pose / expression | `list_poses` `load_pose` `save_pose` `list_expressions` `set_expression` |
-| Bone control | `list_controls` `get_control` `set_control` `set_gaze` |
+| Morphs | `morph_action` (list / set / get / reset) |
+| Clothing / hair | `clothing_action` `hair_action` (presets, items, add/remove/wear) |
+| Pose / expression | `pose_action` (list / load / save / savefull) `expression_action` |
+| Controls | `list_controls` `get_control` `set_control` `set_control_state` `control_pose` `person_teleport` `person_point_at` `set_gaze` |
 | Generic parameters (long tail) | `list_atom_storables` `list_storable_params` `get_param` `set_param` `call_action` |
-| Camera | `get_camera` `set_camera` `capture_view` |
-| Simulation | `set_simulation` `reset_simulation` |
-| Hub | `hub_browse` `hub_detail` `hub_download` |
+| Camera | `camera_action` (get / set / aim / capture, own MCP camera by default) |
+| Simulation | `simulation_action` (set / reset) |
+| Animation | `animation_action` (patterns, steps, record) |
+| Triggers | `trigger_action` `trigger_ui` |
+| Physics | `physics_action` (objects, joints) |
+| Lights / audio | `light_action` `audio_action` |
+| User preferences | `get_user_preferences` `set_user_preferences` |
+| Scene browser / templates | `scene_browser` `template_browser` |
+| Atom UI | `atom_action` `atom_geometry_choices` |
+| Person animation | `person_animation` |
+| Custom Unity assets | `cua_action` |
+| Package manager | `package_manager` |
+| Hand control / material | `person_hand_control` `person_material` |
+| Scene state / inspection | `scene_state` `atom_tree` `person_state` `physics_state` `simulation_performance` `find_atoms` `storable_diff` `scene_dependencies` `performance_profile` |
+| Hub | `hub_action` (browse / detail / download) |
 | Skin | `set_skin_sss` (subdermis colour) |
-| Plugins | `list_plugins` `add_plugin` `remove_plugin` |
+| Plugins | `plugin_action` (list / add / remove) |
 | Escape hatch (off by default) | `eval_cs` |
 
 Full reference: **[docs/TOOLS.md](docs/TOOLS.md)**.
@@ -144,7 +155,7 @@ src/
 │   ├── HttpServer.cs      # minimal HTTP/1.1 server (Streamable HTTP, Origin check, keep-alive)
 │   ├── McpServer.cs       # MCP protocol: initialize / tools/list / tools/call / resources
 │   ├── Tool.cs            # tool definition (name / description / JSON schema / handler / timeout)
-│   └── ToolRegistry.cs    # all 64 tool registrations
+│   └── ToolRegistry.cs    # all 73 tool registrations
 └── Api/
     └── VaMApi.cs          # VaM control layer (every tool implementation)
 ```

@@ -7,7 +7,7 @@ using UnityEngine;
 using VaMMCP.Mcp;
 
 namespace VaMMCP {
-	[BepInPlugin("com.vammcp.core", "VaMMCP", "1.1.1")]
+	[BepInPlugin("com.vammcp.core", "VaMMCP", "1.2.0")]
 	public class Plugin : BaseUnityPlugin {
 		public static Plugin instance;
 		public static int mainThreadId;
@@ -115,9 +115,6 @@ namespace VaMMCP {
 			} catch { }
 			return true;
 		}
-
-		private bool borderlessApplied;
-		private int watchdogTick;
 
 		private void ApplyKeepAlive() {
 			try { Application.runInBackground = true; } catch { }

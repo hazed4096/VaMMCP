@@ -21,6 +21,17 @@ namespace VaMMCP.Api {
 		public volatile int reqHeight = 720;
 		public volatile string reqPath = "Saves/PluginData/vam-mcp/preview.png";
 
+		/// <summary>
+		/// Render-texture mode. When set, the owner attaches <see cref="rtTarget"/>
+		/// to the camera's targetTexture so the camera renders into it as part of
+		/// the normal frame loop. That matters: a manual cam.Render() drops the
+		/// DAZCharacter meshes VaM submits per frame, which is why off-screen
+		/// captures used to come out as black silhouettes. Grabbing here (after the
+		/// normal render) keeps them, and needs no foreground window.
+		/// </summary>
+		public volatile bool rtMode;
+		public volatile RenderTexture rtTarget;
+
 		/// <summary>Completed-capture counter (increments per grab); poll target for the tool.</summary>
 		public long lastSeq;
 		/// <summary>Copy of the encoded PNG of the last completed grab (inline images).</summary>
@@ -44,6 +55,32 @@ namespace VaMMCP.Api {
 		private void DoGrab() {
 			int w = Mathf.Clamp(reqWidth, 64, 4096);
 			int h = Mathf.Clamp(reqHeight, 64, 4096);
+			RenderTexture srcRt = rtTarget;
+			if (rtMode && srcRt != null) {
+				// The camera just rendered into this RT in the normal frame loop,
+				// so person skin/clothing are in it.
+				RenderTexture prevActive = RenderTexture.active;
+				Texture2D shot = null;
+				try {
+					RenderTexture.active = srcRt;
+					shot = new Texture2D(srcRt.width, srcRt.height, TextureFormat.RGB24, false);
+					shot.ReadPixels(new Rect(0, 0, srcRt.width, srcRt.height), 0, 0);
+					shot.Apply();
+					byte[] rtBytes = shot.EncodeToPNG();
+					lastWidth = shot.width;
+					lastHeight = shot.height;
+					if (!string.IsNullOrEmpty(reqPath)) {
+						string dir = Path.GetDirectoryName(reqPath.Replace('\\', '/'));
+						if (!string.IsNullOrEmpty(dir)) FileManagerSecure.CreateDirectory(dir);
+						FileManagerSecure.WriteAllBytes(reqPath, rtBytes);
+					}
+					lastBytes = rtBytes;
+				} finally {
+					RenderTexture.active = prevActive;
+					if (shot != null) UnityEngine.Object.Destroy(shot);
+				}
+				return;
+			}
 			// The camera just rendered to the screen back buffer; read it while
 			// RenderTexture.active is null (only safe from inside OnPostRender).
 			Texture2D full = new Texture2D(Screen.width, Screen.height, TextureFormat.RGB24, false);
